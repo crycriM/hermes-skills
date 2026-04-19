@@ -221,9 +221,17 @@ def register(hermes):
 After successfully generating files:
 
 1. Confirm: `✅ Skill '[skill-name]' written to ~/.hermes/skills/[category]/[skill-name]/`
-2. Tell user: `Run 'hermes skills reload' to activate, or restart Hermes.`
-3. Ask: `I detected [N] other patterns this session. Want me to propose the next one?`
-4. Offer: `Want to review or edit the generated files before activating?`
+2. **Git track**: Add to whitelist and commit:
+   ```
+   # Add skill path to .skill-whitelist
+   echo "[category]/[skill-name]" >> ~/.hermes/skills/.skill-whitelist
+   cd ~/.hermes/skills && git add -f "[category]/[skill-name]/" .skill-whitelist
+   cd ~/.hermes/skills && git commit -m "add skill: [skill-name]"
+   cd ~/.hermes/skills && git push
+   ```
+3. Tell user: `Run 'hermes skills reload' to activate, or restart Hermes.`
+4. Ask: `I detected [N] other patterns this session. Want me to propose the next one?`
+5. Offer: `Want to review or edit the generated files before activating?`
 
 ---
 
