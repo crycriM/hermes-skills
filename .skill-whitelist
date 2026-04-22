@@ -24,11 +24,10 @@ mlops/session-usage-analytics
 mlops/strix-halo-monitoring
 mlops/stt-discord-whisper-setup
 mlops/turboquant-vulkan-toolbox
-mlops/vault-graph-viewer
 model-manager-gui-spec
 openwebui-clear-embedding-cache
 research/duckduckgo-search
 router-troubleshooting
 software-development/codebase-skeleton
-ssrn-search
+research/ssrn-search
 data-science/supertank
