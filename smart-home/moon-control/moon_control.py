@@ -1,141 +1,120 @@
 """
-Moon Control Skill - Remote control for MOON 390 (MiND 2) network audio player.
+Moon Control Skill — Remote control for MOON 390 (MiND 2) network audio player.
 
-Two-layer architecture:
-  Layer 1: NetAPI (XML over TCP) — transport control, volume, now-playing, browse
-  Layer 2: Airable REST API — streaming service content browse/search (Deezer, Tidal)
+Uses standard UPnP AVTransport + RenderingControl SOAP services (Layer 1).
+The device is a Rygel-based MediaRenderer discovered via SSDP.
 
-Protocol: Single TCP connection multiplexes both NetAPI XML events and raw
-StreamerByteData frames. Discovered port via UPnP SSDP (typically 49152+).
+For streaming service content (Deezer/Tidal), the device uses the airable cloud
+API at https://1080906287.airable.io. SetAVTransportURI with an airable: URI
+and the device fetches the stream directly. This requires the device to have
+an active airable session (established via the MiND app or programmatically).
 
-Reversed from MiND Android app v9.x (com.simaudio.mind, June 2025).
+Usage:
+  from moon_control import MoonDevice, discover
+  device = MoonDevice("192.168.0.172")
+  device.play()
+  device.set_volume(60)
+  info = device.now_playing()
+  device.close()
 """
 
 import socket
-import struct
 import time
-import hashlib
-import hmac
-import json
 import re
-import ssl
-from typing import List, Dict, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, NamedTuple
 from urllib.request import urlopen, Request
 from urllib.error import URLError
-from urllib.parse import urlencode
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════
-# Constants from APK reverse engineering
-# ═══════════════════════════════════════════════════════════════════
+UPNP_AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:2"
+UPNP_RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:2"
+SSDP_ST = "urn:schemas-upnp-org:device:MediaRenderer:1"
+SSDP_MULTICAST = ("239.255.255.250", 1900)
 
-# Port used by MiND devices for control
-MIND_CONTROL_PORT = 49152
-
-# Airable cloud API endpoints
-AIRABLE_MIND1_BASE = "https://3071228948.airable.io"
-AIRABLE_MIND2_BASE = "https://1080906287.airable.io"
+AIRABLE_BASE = "https://1080906287.airable.io"
 AIRABLE_SECRET = "tC3AhgFCLZYMJOaEo9HBqrLwqG3kuUBa"
 
-# NetAPI method names (from NetApiMethod enum, deobfuscated)
-class NetMethod:
-    PLAY = "Play"
-    PAUSE = "Pause"
-    STOP = "Stop"
-    NEXT = "Next"
-    PREVIOUS = "Previous"
-    SET_VOLUME = "SetVolume"
-    GET_VOLUME = "GetVolume"
-    SET_MUTE = "SetMute"
-    GET_MUTE = "GetMute"
-    GET_NOW_PLAYING = "GetNowPlaying"
-    GET_NOW_PLAYING_TIME = "GetNowPlayingTime"
-    SET_SEEK_TIME = "SetSeekToTime"
-    GET_ROWS = "GetRows"
-    PLAY_ROW = "PlayRow"
-    BROWSE_ROW = "BrowseRow"
-    BROWSE_PARENT = "BrowseParent"
-    GO_HOME = "GoHome"
-    GET_ACTIVE_LIST = "GetActiveList"
-    SET_REPEAT = "SetRepeat"
-    SET_RANDOM = "SetRandom"
-    GET_VALID_TRANSPORT_CONTROLS = "GetValidTransportControls"
-    GET_FAVORITES_ITEMS = "GetFavouritesItems"
-    ADD_TO_FAVORITES = "AddURIToFavorites"
-    REMOVE_FROM_FAVORITES = "RemoveItemFromFavourites"
-    GET_FAVORITES_STATUS = "GetFavouritesStatus"
-    TUNNEL_TO_HOST = "TunnelToHost"
-    TUNNEL_FROM_HOST = "TunnelFromHost"
-    PING = "Ping"
-    GET_MAC_ADDRESS = "GetMacAddress"
+
+# ═══════════════════════════════════════════════════════
+# Data classes
+# ═══════════════════════════════════════════════════════
+
+@dataclass
+class TrackInfo:
+    transport_state: str = ""
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    duration: str = ""
+    position: str = ""
+    uri: str = ""
+    nr_tracks: int = 0
+    metadata: str = ""
+
+@dataclass
+class DeviceInfo:
+    ip: str
+    port: int
+    friendly_name: str = "Unknown"
+    model_name: str = "Unknown"
+    manufacturer: str = "Unknown"
+    serial_number: str = ""
+    udn: str = ""
+    description_url: str = ""
+    av_transport_url: str = ""
+    rendering_control_url: str = ""
+    services: Dict[str, str] = field(default_factory=dict)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# UPnP / SSDP Discovery
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+# SSDP Discovery
+# ═══════════════════════════════════════════════════════
 
-def discover_mind_devices(timeout: int = 5) -> List[Dict[str, Any]]:
-    """Discover MiND devices on the network using SSDP.
-
-    Returns list of dicts with keys:
-      ip, port, description_url, friendly_name, model_name
-    """
+def discover(timeout: float = 3.0) -> List[DeviceInfo]:
+    """Discover MiND devices via SSDP and return device info."""
     M_SEARCH = (
         b'M-SEARCH * HTTP/1.1\r\n'
         b'HOST: 239.255.255.250:1900\r\n'
         b'MAN: "ssdp:discover"\r\n'
-        b'ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n'
+        b'ST: ' + SSDP_ST.encode() + b'\r\n'
         b'MX: 2\r\n'
         b'\r\n'
     )
 
+    seen = set()
     devices = []
-    seen_ips = set()
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.settimeout(timeout)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        sock.sendto(M_SEARCH, ('239.255.255.250', 1900))
+        sock.sendto(M_SEARCH, SSDP_MULTICAST)
 
         start = time.time()
         while time.time() - start < timeout:
             try:
                 data, addr = sock.recvfrom(4096)
                 ip = addr[0]
-                if ip in seen_ips:
+                if ip in seen:
                     continue
-                seen_ips.add(ip)
+                seen.add(ip)
 
-                response = data.decode('utf-8', errors='ignore')
-                lines = response.split('\r\n')
-
+                resp = data.decode('utf-8', errors='ignore')
                 location = None
-                for line in lines:
+                for line in resp.split('\r\n'):
                     if line.upper().startswith('LOCATION:'):
                         location = line.split(':', 1)[1].strip()
                         break
 
                 if location:
-                    # Parse: http://ip:port/path
-                    if location.startswith('http://'):
-                        location = location[7:]
-                    host_part, _, _ = location.partition('/')
-                    if ':' in host_part:
-                        device_ip, port_str = host_part.split(':', 1)
-                        port = int(port_str)
-                    else:
-                        device_ip = host_part
-                        port = MIND_CONTROL_PORT
-
-                    devices.append({
-                        'ip': device_ip,
-                        'port': port,
-                        'description_url': f'http://{host_part}/description.xml',
-                        'friendly_name': 'Unknown',
-                        'model_name': 'Unknown',
-                    })
+                    dev = _fetch_description(location, ip)
+                    if dev:
+                        devices.append(dev)
 
             except socket.timeout:
                 break
@@ -143,477 +122,530 @@ def discover_mind_devices(timeout: int = 5) -> List[Dict[str, Any]]:
                 continue
 
         sock.close()
-
     except Exception as e:
-        print(f"SSDP discovery failed: {e}")
-
-    # Enrich with device description
-    for dev in devices[:]:
-        try:
-            with urlopen(dev['description_url'], timeout=3) as resp:
-                root = ET.fromstring(resp.read())
-                ns = {'': 'urn:schemas-upnp-org:device-1-0'}
-                fn = root.find('.//friendlyName', ns)
-                mn = root.find('.//modelName', ns)
-                if fn is not None and fn.text:
-                    dev['friendly_name'] = fn.text
-                if mn is not None and mn.text:
-                    dev['model_name'] = mn.text
-        except Exception:
-            pass
+        print(f"SSDP error: {e}")
 
     return devices
 
 
-# ═══════════════════════════════════════════════════════════════════
-# NetAPI client — TCP socket, XML event exchange
-# ═══════════════════════════════════════════════════════════════════
+def _fetch_description(location: str, ip: str) -> Optional[DeviceInfo]:
+    """Fetch and parse UPnP device description XML."""
+    try:
+        with urlopen(location, timeout=3) as resp:
+            root = ET.fromstring(resp.read())
+    except Exception:
+        return None
 
-class NetApiClient:
-    """Low-level NetAPI client over TCP."""
+    ns = {
+        '': 'urn:schemas-upnp-org:device-1-0',
+        'dlna': 'urn:schemas-dlna-org:device-1-0',
+    }
 
-    def __init__(self, ip: str, port: int = MIND_CONTROL_PORT):
+    device_el = root.find('.//device', ns)
+    if device_el is None:
+        return None
+
+    def find_text(tag):
+        el = device_el.find(tag, ns)
+        return el.text if el is not None and el.text else ""
+
+    dev = DeviceInfo(
+        ip=ip,
+        port=_extract_port(location),
+        friendly_name=find_text('friendlyName'),
+        model_name=find_text('modelName'),
+        manufacturer=find_text('manufacturer'),
+        serial_number=find_text('serialNumber'),
+        udn=find_text('UDN'),
+        description_url=location,
+    )
+
+    # Find service control URLs
+    base = location.rsplit('/', 1)[0]
+    service_list = device_el.find('serviceList', ns)
+    if service_list is not None:
+        for svc in service_list.findall('service', ns):
+            stype = find_text_in(svc, 'serviceType', ns)
+            curl = find_text_in(svc, 'controlURL', ns)
+            if stype and curl:
+                full_url = curl if curl.startswith('http') else base + curl
+                dev.services[stype] = full_url
+
+    # Convenience shortcuts
+    for key, stype in [('av_transport_url', UPNP_AV_TRANSPORT),
+                       ('rendering_control_url', UPNP_RENDERING_CONTROL)]:
+        if stype in dev.services:
+            setattr(dev, key, dev.services[stype])
+        # Also try version 1
+        stype_v1 = stype.replace(':2', ':1')
+        if stype_v1 in dev.services:
+            setattr(dev, key, dev.services[stype_v1])
+
+    return dev
+
+
+def _extract_port(url: str) -> int:
+    """Extract port from URL."""
+    url = url.replace('http://', '')
+    host = url.split('/')[0]
+    if ':' in host:
+        return int(host.split(':')[1])
+    return 80
+
+
+def find_text_in(el, tag, ns):
+    child = el.find(tag, ns)
+    return child.text if child is not None and child.text else ""
+
+
+# ═══════════════════════════════════════════════════════
+# UPnP SOAP client
+# ═══════════════════════════════════════════════════════
+
+class MoonDevice:
+    """Control a MOON 390 via UPnP AVTransport + RenderingControl."""
+
+    def __init__(self, ip: str, port: int = 47561):
         self.ip = ip
         self.port = port
-        self._sock: Optional[socket.socket] = None
-        self._connected = False
+        self.base = f"http://{ip}:{port}"
 
-    @property
-    def connected(self) -> bool:
-        return self._connected and self._sock is not None
+        # Discover control URLs from device description
+        dev = self._get_device_info()
+        self.avt_url = dev.av_transport_url or f"{self.base}/Control/LibRygelRenderer/RygelAVTransport"
+        self.rcs_url = dev.rendering_control_url or f"{self.base}/Control/LibRygelRenderer/RygelRenderingControl"
+        self.friendly_name = dev.friendly_name
+        self.model_name = dev.model_name
+        self._session = None
 
-    def connect(self, timeout: float = 5.0) -> bool:
-        """Establish TCP connection."""
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(timeout)
-            self._sock.connect((self.ip, self.port))
-            self._connected = True
-            return True
-        except Exception as e:
-            print(f"Failed to connect to {self.ip}:{self.port}: {e}")
-            self._sock = None
-            self._connected = False
-            return False
-
-    def disconnect(self):
-        """Close TCP connection."""
-        if self._sock:
+    def _get_device_info(self) -> DeviceInfo:
+        """Fetch device description and return DeviceInfo."""
+        # Try common locations
+        candidates = [
+            f"{self.base}/4a4012fc-86dd-4ee2-bd9b-064a08e99c4b.xml",
+            f"{self.base}/description.xml",
+        ]
+        for url in candidates:
             try:
-                self._sock.close()
+                dev = _fetch_description(url, self.ip)
+                if dev and dev.services:
+                    return dev
             except Exception:
-                pass
-            finally:
-                self._sock = None
-                self._connected = False
+                continue
+        return DeviceInfo(ip=self.ip, port=self.port)
 
-    def _recv_all(self, timeout: float = 5.0) -> bytes:
-        """Receive data until socket closes or timeout."""
-        if self._sock is None:
-            return b""
-        self._sock.settimeout(timeout)
-        data = b""
-        try:
-            while True:
-                chunk = self._sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-        except socket.timeout:
-            pass
-        return data
+    # ── Low-level SOAP ──────────────────────────────────
 
-    def send_event(self, method: str, items: Optional[List[Dict[str, str]]] = None,
-                   property_name: str = "", data_value: str = "") -> Optional[str]:
-        """Send a NetAPI XML event and optionally receive response.
-
-        Args:
-            method: NetMethod value (e.g., "Play", "Pause")
-            items: list of key-value dicts for the event
-            property_name: property name (for enum methods)
-            data_value: data value (for enum methods)
-
-        Returns:
-            Response XML string if available, None otherwise.
-        """
-        if not self.connected:
-            print("Not connected")
-            return None
-
-        # Build XML event
-        # <event><name>Play</name>...</event>
-        xml_parts = ['<event>', f'<name>{method}</name>']
-        if items:
-            xml_parts.append('<items>')
-            for item in items:
-                xml_parts.append('<map>')
-                for k, v in item.items():
-                    xml_parts.append(f'<{k}>{v}</{k}>')
-                xml_parts.append('</map>')
-            xml_parts.append('</items>')
-        xml_parts.append('</event>')
-        xml_body = ''.join(xml_parts)
-
-        # Wrap in HTTP POST (NetAPI uses HTTP-like framing over TCP)
-        http_request = (
-            f"POST /NetApi HTTP/1.1\r\n"
-            f"Host: {self.ip}:{self.port}\r\n"
-            f"Content-Type: text/xml\r\n"
-            f"Content-Length: {len(xml_body)}\r\n"
-            f"Connection: keep-alive\r\n"
-            f"\r\n"
-            f"{xml_body}"
+    def _soap(self, service_url: str, service_type: str,
+              action: str, body: str) -> str:
+        """Send SOAP request and return response XML string."""
+        ns = service_type.replace(':2', ':1') if ':2' in service_type else service_type
+        envelope = (
+            '<?xml version="1.0"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            '<s:Body>' + body + '</s:Body>'
+            '</s:Envelope>'
         )
-
+        headers = {
+            'Content-Type': 'text/xml; charset="utf-8"',
+            'SOAPACTION': f'"{ns}#{action}"',
+        }
+        req = Request(service_url, envelope.encode(), headers)
         try:
-            if self._sock is None:
-                print("Socket is None")
-                return None
-            self._sock.send(http_request.encode('utf-8'))
-            response = self._recv_all(timeout=3.0)
-            if response:
-                # Parse HTTP response to get body
-                parts = response.split(b'\r\n\r\n', 1)
-                if len(parts) > 1:
-                    return parts[1].decode('utf-8', errors='ignore')
-            return None
+            with urlopen(req, timeout=5) as r:
+                return r.read().decode()
         except Exception as e:
-            print(f"Failed to send event: {e}")
-            self._connected = False
-            return None
+            raise RuntimeError(f"SOAP {action} failed: {e}")
 
+    def _avt(self, action: str, body: str) -> str:
+        return self._soap(self.avt_url, UPNP_AV_TRANSPORT, action, body)
 
-# ═══════════════════════════════════════════════════════════════════
-# Moon Controller — high-level API
-# ═══════════════════════════════════════════════════════════════════
+    def _rcs(self, action: str, body: str) -> str:
+        return self._soap(self.rcs_url, UPNP_RENDERING_CONTROL, action, body)
 
-class MoonController:
-    """High-level controller for MOON 390 (MiND 2) device."""
-
-    def __init__(self, ip: str, port: int = MIND_CONTROL_PORT):
-        self.ip = ip
-        self.port = port
-        self._client = NetApiClient(ip, port)
-
-    def connect(self) -> bool:
-        return self._client.connect()
-
-    def disconnect(self):
-        self._client.disconnect()
-
-    # ── Transport Control ────────────────────────────────────────
+    # ── Transport Control ───────────────────────────────
 
     def play(self):
-        self._client.send_event(NetMethod.PLAY)
+        """Start or resume playback."""
+        body = (
+            f'<u:Play xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID><Speed>1</Speed>'
+            '</u:Play>'
+        )
+        self._avt("Play", body)
 
     def pause(self):
-        self._client.send_event(NetMethod.PAUSE)
+        """Pause playback."""
+        body = (
+            f'<u:Pause xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:Pause>'
+        )
+        self._avt("Pause", body)
 
     def stop(self):
-        self._client.send_event(NetMethod.STOP)
+        """Stop playback."""
+        body = (
+            f'<u:Stop xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:Stop>'
+        )
+        self._avt("Stop", body)
 
-    def next_track(self):
-        self._client.send_event(NetMethod.NEXT)
+    def next(self):
+        """Skip to next track."""
+        body = (
+            f'<u:Next xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:Next>'
+        )
+        self._avt("Next", body)
 
-    def previous_track(self):
-        self._client.send_event(NetMethod.PREVIOUS)
+    def previous(self):
+        """Go to previous track."""
+        body = (
+            f'<u:Previous xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:Previous>'
+        )
+        self._avt("Previous", body)
 
-    def toggle_play_pause(self):
-        # Try playing; device will interpret based on current state
-        self._client.send_event(NetMethod.PLAY)
+    def seek(self, target: str):
+        """Seek to position. Format: HH:MM:SS or track number."""
+        body = (
+            f'<u:Seek xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '<Unit>REL_TIME</Unit>'
+            f'<Target>{target}</Target>'
+            '</u:Seek>'
+        )
+        self._avt("Seek", body)
 
-    def seek(self, seconds: int):
-        """Seek to position in seconds."""
-        self._client.send_event(NetMethod.SET_SEEK_TIME,
-                                items=[{"time": str(seconds)}])
+    # ── Queue / URI ─────────────────────────────────────
 
-    # ── Volume / Mute ────────────────────────────────────────────
+    def set_uri(self, uri: str, metadata: str = ""):
+        """Set the current playback URI (e.g., a airable: Deezer URI)."""
+        body = (
+            f'<u:SetAVTransportURI xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            f'<CurrentURI>{uri}</CurrentURI>'
+            f'<CurrentURIMetaData>{metadata}</CurrentURIMetaData>'
+            '</u:SetAVTransportURI>'
+        )
+        self._avt("SetAVTransportURI", body)
+
+    def play_uri(self, uri: str, metadata: str = ""):
+        """Set URI and start playback."""
+        self.set_uri(uri, metadata)
+        self.play()
+
+    def play_deezer_track(self, track_id: int):
+        """Play a Deezer track by ID via airable."""
+        uri = f"airable:{AIRABLE_BASE}/deezer/play/mp3/128/{track_id}"
+        self.play_uri(uri)
+
+    def play_deezer_playlist(self, playlist_id: int):
+        """Play a Deezer playlist by ID via airable."""
+        uri = f"airable:{AIRABLE_BASE}/deezer/playlist/{playlist_id}"
+        self.play_uri(uri)
+
+    # ── Volume / Mute ───────────────────────────────────
 
     def set_volume(self, volume: int):
         """Set volume (0-100)."""
-        self._client.send_event(NetMethod.SET_VOLUME,
-                                items=[{"volume": str(volume)}])
+        body = (
+            f'<u:SetVolume xmlns:u="{UPNP_RENDERING_CONTROL}">'
+            '<InstanceID>0</InstanceID>'
+            '<Channel>Master</Channel>'
+            f'<DesiredVolume>{volume}</DesiredVolume>'
+            '</u:SetVolume>'
+        )
+        self._rcs("SetVolume", body)
 
-    def get_volume(self) -> Optional[int]:
+    def get_volume(self) -> int:
         """Get current volume."""
-        resp = self._client.send_event(NetMethod.GET_VOLUME)
-        if resp:
-            match = re.search(r'<volume>(\d+)</volume>', resp)
-            if match:
-                return int(match.group(1))
-        return None
+        body = (
+            f'<u:GetVolume xmlns:u="{UPNP_RENDERING_CONTROL}">'
+            '<InstanceID>0</InstanceID>'
+            '<Channel>Master</Channel>'
+            '</u:GetVolume>'
+        )
+        resp = self._rcs("GetVolume", body)
+        m = re.search(r'<CurrentVolume>(\d+)</CurrentVolume>', resp)
+        return int(m.group(1)) if m else 0
 
     def set_mute(self, muted: bool):
         """Mute or unmute."""
-        self._client.send_event(NetMethod.SET_MUTE,
-                                items=[{"mute": "1" if muted else "0"}])
+        body = (
+            f'<u:SetMute xmlns:u="{UPNP_RENDERING_CONTROL}">'
+            '<InstanceID>0</InstanceID>'
+            '<Channel>Master</Channel>'
+            f'<DesiredMute>{"1" if muted else "0"}</DesiredMute>'
+            '</u:SetMute>'
+        )
+        self._rcs("SetMute", body)
 
-    # ── Now Playing ──────────────────────────────────────────────
+    def get_mute(self) -> bool:
+        """Get mute state."""
+        body = (
+            f'<u:GetMute xmlns:u="{UPNP_RENDERING_CONTROL}">'
+            '<InstanceID>0</InstanceID>'
+            '<Channel>Master</Channel>'
+            '</u:GetMute>'
+        )
+        resp = self._rcs("GetMute", body)
+        m = re.search(r'<CurrentMute>(\d)</CurrentMute>', resp)
+        return bool(int(m.group(1))) if m else False
 
-    def get_now_playing(self) -> Optional[str]:
-        """Get current track info (raw XML)."""
-        return self._client.send_event(NetMethod.GET_NOW_PLAYING)
+    # ── Now Playing ─────────────────────────────────────
 
-    def get_play_time(self) -> Optional[Tuple[int, int]]:
-        """Get (elapsed_seconds, total_seconds)."""
-        resp = self._client.send_event(NetMethod.GET_NOW_PLAYING_TIME)
-        if resp:
-            m1 = re.search(r'<elapsed>(\d+)</elapsed>', resp)
-            m2 = re.search(r'<total>(\d+)</total>', resp)
-            if m1 and m2:
-                return (int(m1.group(1)), int(m2.group(1)))
-        return None
+    def get_transport_info(self) -> Dict[str, str]:
+        """Get transport state."""
+        body = (
+            f'<u:GetTransportInfo xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:GetTransportInfo>'
+        )
+        resp = self._avt("GetTransportInfo", body)
+        return {
+            'CurrentTransportState':
+                _re_first(r'<CurrentTransportState>(.*?)</', resp) or "",
+            'CurrentTransportStatus':
+                _re_first(r'<CurrentTransportStatus>(.*?)</', resp) or "",
+            'CurrentSpeed':
+                _re_first(r'<CurrentSpeed>(.*?)</', resp) or "",
+        }
 
-    # ── Browsing ─────────────────────────────────────────────────
+    def get_media_info(self) -> Dict[str, str]:
+        """Get current media info."""
+        body = (
+            f'<u:GetMediaInfo xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:GetMediaInfo>'
+        )
+        resp = self._avt("GetMediaInfo", body)
+        return {
+            'NrTracks': _re_first(r'<NrTracks>(.*?)</', resp) or "0",
+            'MediaDuration': _re_first(r'<MediaDuration>(.*?)</', resp) or "",
+            'CurrentURI': _re_first(r'<CurrentURI>(.*?)</', resp) or "",
+            'CurrentURIMetaData': _re_first(r'<CurrentURIMetaData>(.*?)</', resp) or "",
+            'NextURI': _re_first(r'<NextURI>(.*?)</', resp) or "",
+        }
 
-    def get_rows(self, start: int = 0, end: int = 99) -> Optional[str]:
-        """Get content rows (raw XML)."""
-        items = [{"start": str(start)}, {"end": str(end)}]
-        return self._client.send_event(NetMethod.GET_ROWS, items=items)
+    def get_position_info(self) -> Dict[str, str]:
+        """Get playback position."""
+        body = (
+            f'<u:GetPositionInfo xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:GetPositionInfo>'
+        )
+        resp = self._avt("GetPositionInfo", body)
+        return {
+            'Track': _re_first(r'<Track>(.*?)</', resp) or "0",
+            'TrackDuration': _re_first(r'<TrackDuration>(.*?)</', resp) or "",
+            'RelTime': _re_first(r'<RelTime>(.*?)</', resp) or "",
+            'AbsTime': _re_first(r'<AbsTime>(.*?)</', resp) or "",
+        }
 
-    def play_row(self, row_index: int) -> Optional[str]:
-        """Play a specific row."""
-        return self._client.send_event(NetMethod.PLAY_ROW,
-                                       items=[{"index": str(row_index)}])
+    def get_transport_settings(self) -> Dict[str, str]:
+        """Get repeat/shuffle mode."""
+        body = (
+            f'<u:GetTransportSettings xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            '</u:GetTransportSettings>'
+        )
+        resp = self._avt("GetTransportSettings", body)
+        return {
+            'PlayMode': _re_first(r'<PlayMode>(.*?)</', resp) or "",
+            'RecQualityMode': _re_first(r'<RecQualityMode>(.*?)</', resp) or "",
+        }
 
-    def browse_row(self, row_index: int) -> Optional[str]:
-        """Browse into a row."""
-        return self._client.send_event(NetMethod.BROWSE_ROW,
-                                       items=[{"index": str(row_index)}])
+    def set_play_mode(self, mode: str):
+        """Set repeat/shuffle mode. Mode: NORMAL, REPEAT_ALL, REPEAT_ONE, SHUFFLE."""
+        body = (
+            f'<u:SetPlayMode xmlns:u="{UPNP_AV_TRANSPORT}">'
+            '<InstanceID>0</InstanceID>'
+            f'<NewPlayMode>{mode}</NewPlayMode>'
+            '</u:SetPlayMode>'
+        )
+        self._avt("SetPlayMode", body)
 
-    def browse_parent(self) -> Optional[str]:
-        """Go up one level."""
-        return self._client.send_event(NetMethod.BROWSE_PARENT)
+    def now_playing(self) -> TrackInfo:
+        """Get comprehensive now-playing info."""
+        transport = self.get_transport_info()
+        media = self.get_media_info()
+        position = self.get_position_info()
 
-    def go_home(self):
-        """Return to home screen."""
-        self._client.send_event(NetMethod.GO_HOME)
+        info = TrackInfo(
+            transport_state=transport.get('CurrentTransportState', ''),
+            uri=media.get('CurrentURI', ''),
+            nr_tracks=int(media.get('NrTracks', '0')),
+            duration=position.get('TrackDuration', ''),
+            position=position.get('RelTime', ''),
+            metadata=media.get('CurrentURIMetaData', ''),
+        )
 
-    # ── Favorites ────────────────────────────────────────────────
+        # Parse DIDL-Lite metadata if available
+        meta_xml = info.metadata
+        if meta_xml:
+            try:
+                root = ET.fromstring(meta_xml)
+                ns_dc = 'http://purl.org/dc/elements/1.1/'
+                ns_upnp = 'urn:schemas-upnp-org:metadata-1-0/upnp/'
+                title_el = root.find(f'.//{{{ns_dc}}}title')
+                artist_el = root.find(f'.//{{{ns_upnp}}}artist')
+                album_el = root.find(f'.//{{{ns_upnp}}}album')
+                info.title = title_el.text if title_el is not None and title_el.text else ""
+                info.artist = artist_el.text if artist_el is not None and artist_el.text else ""
+                info.album = album_el.text if album_el is not None and album_el.text else ""
+            except ET.ParseError:
+                pass
 
-    def get_favorites(self) -> Optional[str]:
-        """Get favorites list (raw XML)."""
-        return self._client.send_event(NetMethod.GET_FAVORITES_ITEMS)
+        return info
 
-    def add_to_favorites(self, uri: str):
-        """Add URI to favorites."""
-        self._client.send_event(NetMethod.ADD_TO_FAVORITES,
-                                items=[{"uri": uri}])
+    # ── Lifecycle ───────────────────────────────────────
 
-    def remove_from_favorites(self, uri: str):
-        """Remove URI from favorites."""
-        self._client.send_event(NetMethod.REMOVE_FROM_FAVORITES,
-                                items=[{"uri": uri}])
+    def close(self):
+        """Clean up."""
+        pass
 
-    # ── Misc ─────────────────────────────────────────────────────
+    def __enter__(self):
+        return self
 
-    def ping(self) -> bool:
-        """Ping the device to check connectivity."""
-        resp = self._client.send_event(NetMethod.PING)
-        return resp is not None
-
-    def get_mac_address(self) -> Optional[str]:
-        """Get device MAC address."""
-        resp = self._client.send_event(NetMethod.GET_MAC_ADDRESS)
-        if resp:
-            match = re.search(r'<mac>([0-9A-Fa-f:]+)</mac>', resp)
-            if match:
-                return match.group(1)
-        return None
+    def __exit__(self, *args):
+        self.close()
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Airable REST API client — streaming service content
-# ═══════════════════════════════════════════════════════════════════
+def _re_first(pattern, text):
+    m = re.search(pattern, text)
+    return m.group(1) if m else None
+
+
+# ═══════════════════════════════════════════════════════
+# Airable REST client (for content browse/search)
+# ═══════════════════════════════════════════════════════
+
+import json as _json
+
 
 class AirableClient:
-    """Client for the airable cloud API (Deezer, Tidal, etc. content).
+    """Client for the airable cloud API (Deezer/Tidal content browse).
 
-    The airable API is a REST/JSON API that provides content browsing
-    for streaming services integrated into the MiND platform.
+    The device needs an active airable session to stream content.
+    This client can browse and search, but playback requires
+    MoonDevice.play_deezer_track() or play_deezer_playlist().
     """
 
-    def __init__(self, base_url: str = AIRABLE_MIND2_BASE,
+    def __init__(self, base_url: str = AIRABLE_BASE,
                  secret: str = AIRABLE_SECRET):
         self.base_url = base_url.rstrip('/')
         self.secret = secret
         self._token: Optional[str] = None
-        self._session_data: Optional[Dict] = None
 
     def authenticate(self, username: str, password: str,
                      service: str = "deezer") -> bool:
-        """Authenticate with the airable API.
-
-        Args:
-            username: service username/email
-            password: service password
-            service: streaming service name (deezer, tidal, etc.)
-
-        Returns:
-            True if authentication succeeded.
-        """
-        auth_url = f"{self.base_url}/authentication"
-        payload = {
+        """Authenticate with airable."""
+        url = f"{self.base_url}/authentication"
+        payload = _json.dumps({
             "username": username,
             "password": password,
             "service": service,
-        }
-
-        try:
-            req = Request(auth_url,
-                          data=json.dumps(payload).encode('utf-8'),
-                          headers={
-                              'Content-Type': 'application/json',
-                              'X-Airable-Secret': self.secret,
-                          })
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-                self._token = data.get('token')
-                self._session_data = data
-                return self._token is not None
-        except Exception as e:
-            print(f"Airable authentication failed: {e}")
-            return False
-
-    def _request(self, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make an authenticated request to the airable API."""
-        if not self._token:
-            print("Not authenticated")
-            return None
-
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        if params:
-            url += '?' + urlencode(params)
-
+        }).encode()
         headers = {
-            'Authorization': f'Bearer {self._token}',
+            'Content-Type': 'application/json',
             'X-Airable-Secret': self.secret,
         }
+        try:
+            req = Request(url, payload, headers)
+            with urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+                self._token = data.get('token')
+                return self._token is not None
+        except Exception as e:
+            print(f"Airable auth failed: {e}")
+            return False
 
+    def search(self, query: str, service: str = "deezer") -> List[Dict]:
+        """Search for content."""
+        if not self._token:
+            return []
+        url = f"{self.base_url}/search?q={query}&service={service}"
+        headers = {'Authorization': f'Bearer {self._token}'}
         try:
             req = Request(url, headers=headers)
             with urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
+                data = _json.loads(resp.read())
+                return data.get('items', [])
         except Exception as e:
-            print(f"Airable request failed: {e}")
-            return None
-
-    def get_streaming_services(self) -> Optional[List[Dict]]:
-        """Get list of available streaming services."""
-        result = self._request("streaming")
-        if result:
-            return result.get('items', [])
-        return None
-
-    def get_directory(self, directory_id: str) -> Optional[Dict]:
-        """Get content of a directory (album, playlist, etc.)."""
-        return self._request(f"streaming/{directory_id}")
-
-    def search(self, query: str, service: str = "deezer") -> Optional[List[Dict]]:
-        """Search for content on a streaming service."""
-        result = self._request("search", {"q": query, "service": service})
-        if result:
-            return result.get('items', [])
-        return None
-
-    def get_content(self, url: str) -> Optional[Dict]:
-        """Fetch content from a specific URL."""
-        # For external URLs, use direct request
-        try:
-            req = Request(url, headers={
-                'Authorization': f'Bearer {self._token}',
-            })
-            with urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
-        except Exception as e:
-            print(f"Content fetch failed: {e}")
-            return None
+            print(f"Search failed: {e}")
+            return []
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Convenience: discover & connect
-# ═══════════════════════════════════════════════════════════════════
-
-def discover_and_connect(timeout: int = 5) -> Optional[MoonController]:
-    """Discover MiND devices and return controller for the first one found."""
-    devices = discover_mind_devices(timeout)
-    if not devices:
-        print("No MiND devices found on network")
-        return None
-
-    device = devices[0]
-    print(f"Found: {device['friendly_name']} ({device['model_name']}) "
-          f"at {device['ip']}:{device['port']}")
-
-    ctrl = MoonController(device['ip'], device['port'])
-    if ctrl.connect():
-        return ctrl
-    else:
-        print(f"Failed to connect to {device['ip']}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════════
-# CLI demo
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python moon_control.py <command> [args]")
-        print("Commands: discover, play, pause, stop, next, prev, vol <n>, np")
+        print("Usage: moon_control.py discover|status|play|pause|stop|next|prev|vol [n]|mute [on|off]")
         sys.exit(1)
 
     cmd = sys.argv[1]
 
     if cmd == "discover":
-        devices = discover_mind_devices()
-        if devices:
-            print(f"Found {len(devices)} device(s):")
-            for i, d in enumerate(devices):
-                print(f"  {i+1}. {d['friendly_name']} ({d['model_name']}) — {d['ip']}:{d['port']}")
-        else:
-            print("No MiND devices found")
+        devices = discover()
+        for i, d in enumerate(devices):
+            print(f"{i+1}. {d.friendly_name} ({d.model_name}) — {d.ip}:{d.port}")
+        if not devices:
+            print("No devices found")
 
     else:
-        # Need IP - discover first
-        devices = discover_mind_devices()
+        devices = discover()
         if not devices:
-            print("No devices found. Specify IP with --ip <addr>")
+            print("No devices found")
             sys.exit(1)
+        dev = devices[0]
+        device = MoonDevice(dev.ip, dev.port)
+        print(f"Connected: {dev.friendly_name} ({dev.model_name})")
 
-        ip = devices[0]['ip']
-        port = devices[0]['port']
-
-        ctrl = MoonController(ip, port)
-        if not ctrl.connect():
-            print("Connection failed")
-            sys.exit(1)
-
-        if cmd == "play":
-            ctrl.play()
-            print("▶ Play")
+        if cmd == "status":
+            np = device.now_playing()
+            vol = device.get_volume()
+            mute = device.get_mute()
+            print(f"  State:   {np.transport_state}")
+            print(f"  Volume:  {vol}{' (MUTED)' if mute else ''}")
+            if np.title:
+                print(f"  Title:   {np.title}")
+                print(f"  Artist:  {np.artist}")
+                print(f"  Time:    {np.position} / {np.duration}")
+        elif cmd == "play":
+            device.play()
+            print("▶ Playing")
         elif cmd == "pause":
-            ctrl.pause()
-            print("⏸ Pause")
+            device.pause()
+            print("⏸ Paused")
         elif cmd == "stop":
-            ctrl.stop()
-            print("⏹ Stop")
+            device.stop()
+            print("⏹ Stopped")
         elif cmd == "next":
-            ctrl.next_track()
+            device.next()
             print("⏭ Next")
         elif cmd == "prev":
-            ctrl.previous_track()
+            device.previous()
             print("⏮ Previous")
         elif cmd == "vol":
             if len(sys.argv) > 2:
-                ctrl.set_volume(int(sys.argv[2]))
-                print(f"🔊 Volume: {sys.argv[2]}")
-        elif cmd == "np":
-            resp = ctrl.get_now_playing()
-            print(resp or "No now-playing info")
-        else:
-            print(f"Unknown command: {cmd}")
+                device.set_volume(int(sys.argv[2]))
+            print(f"Volume: {device.get_volume()}")
+        elif cmd == "mute":
+            state = sys.argv[2] if len(sys.argv) > 2 else "toggle"
+            if state in ("on", "1"):
+                device.set_mute(True)
+            elif state in ("off", "0"):
+                device.set_mute(False)
+            print(f"Mute: {device.get_mute()}")
 
-        ctrl.disconnect()
+        device.close()
