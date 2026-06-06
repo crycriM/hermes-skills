@@ -97,10 +97,19 @@ sudo make KERNEL_BUILD=/lib/modules/NEW_KERNEL/build install
 # If MOK already enrolled for this key, just reboot:
 sudo reboot
 
-# Pin GRUB to new kernel if needed
-sudo sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' /etc/default/grub
+# Check GRUB pin is in place — it should auto-target the pinned kernel:
+grep "^GRUB_DEFAULT" /etc/default/grub
+# Expected: GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux KERNEL_VERSION-generic"
+
+# If not pinned, revert to latest or pin to current:
+# Pin to current running kernel:
+CURRENT=$(uname -r)
+MENUENTRY=$(sudo grep -E "^menuentry" /boot/grub/grub.cfg | grep "$CURRENT" | head -1 | sed "s/menuentry '\([^']*\)'.*/\1/")
+sudo sed -i "s/^GRUB_DEFAULT=.*/GRUB_DEFAULT=\"Advanced options for Ubuntu>$MENUENTRY\"/" /etc/default/grub
 sudo update-grub
 ```
+
+**May 2025 session:** After kernel 7.0.0-15 update, module was already GRUB-pinned. Verified: `extra/` dir had stale unsigned .ko, `updates/` had correct signed one. Cleaned `extra/`, confirmed `updates/` takes precedence. GRUB pin already active — no action needed beyond confirming.
 
 ## Pitfalls
 

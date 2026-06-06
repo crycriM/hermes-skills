@@ -47,12 +47,21 @@ cd ~/llm-server/gui && bash start.sh
 bash ~/llm-server/start-open-webui.sh   # port 8088
 ```
 
-## API Endpoints (proxied through GUI to router)
+## API Endpoints (proxied through GUI → model_manager :8079 → router :8080)
 
-- `GET /api/gpu` — GPU metrics (VRAM, temps, utilization)
-- `GET /api/models` — Currently loaded models with status
+- `GET /api/gpu` — GPU metrics (VRAM, temps, utilization, power mode)
+- `GET /api/models` — All configured models with status, size, context, cache type, and **Thinking** column (`enable_thinking` field: Y/N/—)
+- `GET /api/available` — Same model list (used by the legacy GUI at `gui/app.js`)
 - `POST /api/load` — Load a model: `{"model": "name"}`
 - `POST /api/unload` — Unload a model: `{"model": "name"}`
+- `POST /api/power-mode` — Set APU power mode: `{"mode": "quiet|balanced|performance"}`
+
+### Thinking column
+
+The models table shows a "Thinking" column derived from the `enable_thinking` field in `/api/models`:
+- **Y** (green) — `enable_thinking: true` in preset (thinking model variant)
+- **N** (muted) — `enable_thinking: false` in preset (thinking explicitly disabled)
+- **—** (gray) — no `chat-template-kwargs` in preset (model default)
 
 ## Notes
 

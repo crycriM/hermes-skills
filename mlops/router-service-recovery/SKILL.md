@@ -56,11 +56,66 @@ When `m5-router.service` fails to start, follow these steps:
 - Do not copy RoPE/sampling params between models — each architecture has its own values.
 - After 2 failed patch attempts, stop and read the full file to ensure correctness.
 - **Port conflict symptom:** If router starts but GUI won't show/select models, check for standalone `llama-server` process on port 8080 (PID from `lsof -i :8080`). Kill it before restarting m5-router.service. Router needs exclusive binding to serve multiple models.
+- **`start-native-router.sh` validator is stricter than llama-server:** The script has a hardcoded `KNOWN_KEYS` list that can lag behind llama-server's actual supported flags. If validation fails with "Unknown preset keys" but the key is valid (check `llama-server --help`), add it to `KNOWN_KEYS` in the script. Example: `n-gpu-layers-draft` was missing despite being a valid flag.
 
 **Verification**
 - Ensure `m5-router.service` is `active (running)`.
 - Open WebUI on port 8088 should list all models.
 - Check journal for `Available models (N)` count and no errors.
+
+## Router Mode API Behavior
+
+**Important:** llama.cpp in router mode does NOT support all OpenAI-compatible endpoints.
+
+### Model Loading in Router Mode
+
+The `/v1/models/load` endpoint does NOT exist in router mode. Models must be handled differently:
+
+- **Auto-load mode** (`--models-autoload`): Models load on startup. Recommended for benchmarks and scripts.
+- **Manual mode** (`--no-models-autoload`): Models are unloaded by default and must be triggered via first request to `/v1/chat/completions` with that model. The first request will be slow (model loading), subsequent requests are fast.
+
+### Checking Model Status
+
+Poll the `/v1/models` endpoint to check model load status:
+
+```bash
+curl -s http://localhost:8080/v1/models | python3 <<'PYEOF'
+import json, sys
+d = json.load(sys.stdin)
+for m in d['data']:
+    if m['id'] == 'MODEL_ID':
+        print(f"Status: {m['status']['value']}")
+PYEOF
+```
+
+Status values: `unloaded`, `loading`, `loaded`, `error`.
+
+### Waiting for Auto-load Completion
+
+For scripts that need to wait for model loading (e.g., benchmarks), poll until status is `loaded`:
+
+```bash
+for i in {1..120}; do  # 2 minute timeout
+    status=$(curl -s http://localhost:8080/v1/models | \
+        python3 -c "import json,sys; d=json.load(sys.stdin); \
+        print([m['status']['value'] for m in d['data'] if m['id']=='MODEL_ID'][0] \
+        if any(m['id']=='MODEL_ID' for m in d['data']))")
+    if [[ "$status" == "loaded" ]]; then
+        echo "Model loaded!"
+        break
+    fi
+    if [[ $i -eq 120 ]]; then
+        echo "ERROR: Model failed to load within 120 seconds"
+        exit 1
+    fi
+    sleep 1
+done
+```
+
+**Pitfalls**
+- Never use `/v1/models/load` — it returns 404 in router mode.
+- Don't send `Authorization: Bearer ***` headers with unescaped trailing backslashes. Use `Bearer dummy` for testing or omit entirely.
+- When using `--models-autoload`, ensure VRAM is sufficient for all models in the preset. Router will fail to start if models can't be loaded simultaneously.
 
 ## Adding Custom Chat Templates
 
@@ -180,3 +235,4 @@ When moving m5-router.service from one distrobox container to another (e.g. swit
 **References**
 - See `~/llm-server/llm-models-combined.md` for model performance.
 - Router preset file: `/home/cricri/llm-server/router-preset.ini`
+- KNOWN_KEYS validator: `references/known-keys-validator.md`

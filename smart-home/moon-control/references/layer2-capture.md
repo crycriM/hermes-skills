@@ -1,5 +1,9 @@
 # Layer 2 — Full Investigation Results
 
+> **Prefer hotspot capture for new sessions.** See `references/hotspot-capture.md`
+> for the simpler approach: turn the capture machine into a WiFi AP and connect
+> both MOON + phone to it. No ARP spoofing, no device disruption, cleaner pcaps.
+
 ## What we tried
 
 | Approach | Result |
@@ -12,23 +16,22 @@
 | NetAPI direct HTTP calls | **Success** — `player:player/data` returns full now-playing with Deezer track info |
 | Transport control via NetAPI | **Blocked** — passthrough byte format not decoded |
 
-## Architecture (confirmed)
+## Architecture (confirmed via hotspot capture 2026-06-06)
 
 ```
 Phone (MiND app)
-    |
-    |--- TLS ---> airable.io cloud (browse/search catalog)
-    |
-    |--- TLS ---> Simaudio cloud (relay commands)
-                        |
-                        |--- persistent connection ---> MOON 390
-                                                          |
-                                                          |--- TLS ---> Deezer CDN (audio stream)
+    |-- HTTP :80 -----> MOON 390 (NetAPI: control, playlist, power — DIRECT, no cloud!)
+    |-- TLS ----------> airable.io (Deezer catalog browsing)
+    
+MOON 390
+    |-- TLS ----------> airable.io (preplay/statechange)
+    |-- TLS ----------> Deezer CDN (audio stream)
 ```
 
-The phone has ZERO direct LAN communication with the device for streaming services.
-All control goes through the cloud. The device's `/api/v1` endpoint on port 80 is the
-cloud relay's inbound endpoint (authenticated connections only).
+**Phone talks DIRECTLY to MOON via HTTP port 80 for control.** This was confirmed
+by hotspot capture (see `references/hotspot-capture-results.md`). The cloud relay
+is NOT used for control — only for Deezer catalog browsing and streaming.
+The phone ↔ MOON NetAPI is plain HTTP, no auth required for local access.
 
 ## NetAPI (local HTTP REST on port 80)
 
@@ -72,7 +75,7 @@ GET /api/getRows?path=<path>
 
 | Path | Roles | Purpose |
 |------|-------|---------|
-| `player:player/control` | activate | Transport control — BLOCKED (passthrough bytes) |
+| `player:player/control` | activate | Transport control — **WORKS** with JSON `{"control":"play\|pause\|stop\|next\|previous"}` (confirmed via hotspot capture) |
 | `player:mindVolume` | value | Set volume |
 | `settings:/mediaPlayer/mute` | value | Set mute |
 | `settings:/mediaPlayer/playMode` | value | Set repeat mode |
@@ -123,6 +126,55 @@ Example URLs for track 15586296:
 - `https://1080906287.airable.io/deezer/play/flac/1411/15586296:flow`
 - `https://1080906287.airable.io/deezer/play/mp3/320/15586296:flow`
 - `https://1080906287.airable.io/deezer/play/mp3/128/15586296:flow`
+
+## ARP Spoof Capture (device ↔ cloud relay)
+
+Since the phone has no direct LAN communication with the device, ARP spoofing
+sits between the MOON and the gateway to capture all device ↔ internet traffic.
+Even if TLS-encrypted, connection patterns, endpoints, timing, and DNS queries
+reveal the cloud relay protocol.
+
+### Network layout
+
+```
+Attacker:  192.168.0.44  (eno1)
+MOON 390:  192.168.0.172 (10:c3:7b:4c:7c:a2) — primary UPnP/NetAPI interface (WIRED)
+MOON WiFi: 192.168.0.180 (50:1e:2d:2e:14:5e) — secondary, no NetAPI on port 80. Hostname: audivosimaudiomind2-501e2d2e145c. MOON prefers wired — must unplug Ethernet to force WiFi.
+Gateway:   192.168.0.254 (14:0c:76:97:46:a1)
+```
+
+Target `.172` for capture — that's where NetAPI (port 80) and UPnP (port 43809) live.
+Port changes on reboot; always SSDP-discover before targeting.
+
+### Tooling
+
+Bettercap in Docker with host networking + NET_RAW capability. Run via:
+
+```bash
+bash scripts/arp_capture.sh [duration_seconds]
+```
+
+The script:
+1. Spawns bettercap to ARP-spoof both directions (MOON ↔ gateway)
+2. Captures all traffic to/from MOON IP to a timestamped .pcap in `/tmp/moon_captures/`
+3. Sends cleanup gratuitous ARP on exit
+4. Prints protocol breakdown, SYN connections, and DNS queries
+
+IP forwarding must be enabled (`/proc/sys/net/ipv4/ip_forward = 1`).
+
+### What to look for
+
+- New TCP connections during Deezer actions (browse, play, skip) → cloud relay endpoints
+- DNS queries resolving `*.airable.io` or Simaudio cloud hostnames
+- Non-TLS traffic on unexpected ports (potential unencrypted control channel)
+- Connection timing correlations with app actions
+
+### Pitfalls
+
+- ARP spoof adds latency; streaming may stutter during capture
+- Device may detect ARP conflicts and drop off network — stop capture to restore
+- Docker `--net=host` is required; without it the container can't see host traffic
+- Power-cycle the device after capture to clear any stalled connections
 
 ## Viable paths to close the gap
 

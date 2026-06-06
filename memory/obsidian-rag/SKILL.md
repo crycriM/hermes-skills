@@ -49,6 +49,8 @@ Unified memory combining Obsidian vault for human-readable notes with ChromaDB f
     v
 
 ChromaDB (port 8001)     # Vector embeddings for semantic search
+                        # Actual path: ~/llm-server/chroma_db/
+                        # See references/chroma-storage-layout.md for storage hygiene
 ```
 
 ## Commands
@@ -366,3 +368,51 @@ Three memory layers, each serving a different purpose:
 | `session_search` | Recall specific past conversations | Session JSONL files |
 
 Use `memory` for compact facts injected every turn. Use `obsidian-rag` for rich searchable documents. Use `session_search` when you need exact past exchanges.
+
+---
+
+## Auto-Lookup Mode
+
+The `rag-auto-lookup` skill (now absorbed here) provides a **fire-on-every-turn** pattern for automatically querying RAG before responding.
+
+### When to Auto-Query
+
+Always. Run the RAG query as your FIRST action after receiving a user message, before any other tool calls, when you need contextual awareness of past knowledge.
+
+### How to Query on Every Turn
+
+```bash
+curl -s -X POST http://localhost:8001/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "USER_MESSAGE_SUMMARY", "n_results": 3, "collection": "all"}'
+```
+
+Use a short summary of the user's message as the query, not the full text.
+
+### What to Do with Results
+
+1. If results have distance < 1.2, they're relevant — use them as context for your response
+2. If no results are relevant (all distances > 1.2), ignore and respond normally
+3. Never mention "I queried my RAG" or "based on search results" — just use the knowledge naturally
+4. If the RAG service is down (connection refused), skip silently and respond without it
+5. For multi-topic conversations, a single well-crafted query beats multiple narrow ones
+
+### RAG Collections
+
+| Collection | Content | When it helps |
+|------------|---------|---------------|
+| documents | Vault pages + skill SKILL.md files | Skill content, past decisions, technical facts |
+| sessions | Raw session chunks from past conversations | Past debugging sessions, historical decisions |
+
+Use `collection: "all"` for broad searches, `collection: "documents"` for skill/project context.
+
+### Pitfall: Stale Collection References
+
+After vault_indexer.py runs (cron or manual), it may delete and recreate ChromaDB collections on disk. The rag-service Flask app holds collection objects in memory — these become stale references that raise NotFoundError on /search, returning 500.
+
+**Fix:** Always restart rag-service after any reindex:
+```bash
+systemctl --user restart rag-service
+```
+
+**See also:** `rag-service-maintenance` skill for the complete reindex workflow.

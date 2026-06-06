@@ -8,6 +8,8 @@ version: 1.0
 
 Evaluate local LLMs as autonomous research subagents. Single-shot prompt, no follow-up, no clarification. Models use search tools to produce a structured research deliverable.
 
+**Sequential-only.** Research bench must run AFTER coding bench (and coding after JSON). The router can only serve one model at a time. Running research bench alongside other benchmarks causes request contention and unreliable results. If JSON and coding benches are also queued, finish them first: JSON → coding → research. Use `--no-load` flag if the model is already loaded from a previous bench run.
+
 ## Location
 
 `~/llm-server/research_agent_bench/`
@@ -101,6 +103,10 @@ Composite score: `0.30*coverage + 0.20*source_overlap + 0.15*specificity + 0.15*
 
 Diagnostic only — which tools each model used, call counts, search depth, redundancy.
 
+## Reference material
+
+- `references/step37-record.md` — step37 (Step-3.7-Flash IQ4_XS) composite 1.035 record result with paper lineage and deliverable breakdown.
+
 ## File Structure
 
 ```
@@ -149,6 +155,12 @@ r = terminal(f"curl -s 'https://api.semanticscholar.org/graph/v1/paper/search?qu
 
 Good for finding non-arXiv papers (NIPS, ICML proceedings).
 
+## Thinking Mode Testing
+
+For research bench, thinking mode affects search behavior and deliverable quality. Follow the same procedure as coding-benchmark-runner for toggling thinking mode. **Key pitfall:** `reasoning = none` is invalid (use `off`), and the parent router `--reasoning auto` flag overrides per-model INI — see coding-benchmark-runner skill for the full fix procedure.
+
+**Gemma 4 models:** Use `reasoning = off` in router-preset.ini (not `chat-template-kwargs`). Must also remove global `--reasoning auto` from `start-native-router.sh` — see coding-benchmark-runner for full procedure.
+
 ## Key Pitfalls
 
 1. **Subagents burn iterations on searching** — they don't self-regulate. Run Phase 1 directly with execute_code, not via delegate_task. Phase 2 uses direct API mode (run_bench.py) instead of delegate_task for the same reason.
@@ -188,6 +200,7 @@ Good for finding non-arXiv papers (NIPS, ICML proceedings).
 34. **Gemma4-31b V4 results** — 17 searches (5 arXiv, 3 SSRN via ssrn_via_scholar.py pipeline, 8 web), 682s, 7K chars output. Found the key papers (ROCKET, MiniROCKET, S-Rocket, POCKET, RFF signatures) with accurate summaries. First run with the updated SSRN pipeline (replacing dead curl).
 35. **llama.cpp HTTP server drops long non-streaming connections** — thinking models (Opus distill, etc.) that generate 6500+ tokens over 10+ minutes cause the llama.cpp HTTP server to report "Failed to read connection" and return 500. The `requests.post(timeout=1200)` doesn't help because the server-side disconnect happens during generation. **Fix:** convert to SSE streaming (`"stream": True` in the request, `stream=True` in requests, then iterate `resp.iter_lines()` assembling `delta["content"]` and `delta["reasoning_content"]`). This keeps the TCP connection alive with incremental data. The fix was applied to `run_bench.py` around line 421. Consider applying the same pattern to coding and JSON bench runners if they hit similar timeouts with slow thinking models.
 36. **Post-streaming `data` variable crash** — after converting to streaming, the old code that accesses `resp.json()` / `data["usage"]` will crash with `NameError: name 'data' is not defined`. After the streaming loop, you have `content` and `reasoning` strings assembled from deltas — there is no `data` dict. Replace `data.get("usage", {}).get("total_tokens", 0)` with a rough estimate like `len(content) // 4` or parse the final SSE chunk for usage data. Applied to `run_bench.py` line ~527.
+37. **Post-streaming `resp.text` RuntimeError** — after iterating `resp.iter_lines()` for SSE streaming, `resp.content` is consumed. Any subsequent access to `resp.text` (which internally reads `resp.content`) raises `RuntimeError: The content for this response was already consumed`. This hits the error-handling branch that does `resp.text[:200]` for logging. Fix: use `resp.reason` (the HTTP reason phrase) instead of `resp.text` for error messages after streaming. Applied Apr 2026.
 37. **Delete old response files before re-running** — `run_bench.py` skips models that already have a `response_<model>.md` file >1KB. If re-running after a failed attempt, delete the old response file first: `rm responses/response_<model>.md responses/meta_<model>.json responses/tool_log_<model>.json`. The runner will not overwrite existing files by design (resumability), but stale files from old model versions will cause incorrect skips.
 
 ### Phase 3: Evaluation Script
@@ -234,7 +247,17 @@ Same 4 models + paper fetch tool. Models can now `{"fetch": {"arxiv_id": "..."}}
 
 | Rank | Model | Composite | Time | Searches (a/s/w/f) | Key Finding |
 |------|-------|-----------|------|---------------------|-------------|
-| 1 | holo3-35b | 0.840 | 285s | 11a/3s/5w/5f | Best balance, highest source overlap (0.27) |
-| 2 | cascade2-30b | 0.808 | 243s | 5a/3s/3w/1f | Most sources (46) but low overlap, fetched wrong paper |
-| 3 | qwopus35-27b | 0.790 | 882s | 9a/2s/5w/4f | Perfect citations (1.0), best fetch discipline, slow |
-| 4 | nemotron-120b | 0.655 | 1313s | 8a/1s/1w/3f | Too slow, searched too little, lowest coverage |
+| 1 | step37 | **1.035** | 2022s | 9a/5s/2w/9f | **New record.** Found complete ROCKET lineage (ROCKET→MiniRocket→MultiRocket→HYDRA→S-Rocket→SPROCKET). Zero hallucinations (0.0). Implementation depth 5/5 (pipeline, params, complexity, code). Coverage 1.76 (exceeded reference). Citation validity 0.80 (8/10 verified). |
+| 2 | holo3-35b | 0.840 | 285s | 11a/3s/5w/5f | Best balance, highest source overlap (0.27) |
+| 3 | cascade2-30b | 0.808 | 243s | 5a/3s/3w/1f | Most sources (46) but low overlap, fetched wrong paper |
+| 4 | qwopus35-27b | 0.790 | 882s | 9a/2s/5w/4f | Perfect citations (1.0), best fetch discipline, slow |
+| 5 | nemotron-120b | 0.655 | 1313s | 8a/1s/1w/3f | Too slow, searched too little, lowest coverage |
+
+### V4 — step37 template regression & qwen36-27b
+
+| Model | Composite | Time | Searches | Notes |
+|-------|-----------|------|----------|-------|
+| **step37 (no-think template)** | **0.160** | 353s | 12a/3s/2w/0f | Template fix for coding was applied; research collapsed. Model skipped synthesis, jumped to premature tool calls. **Critical finding:** thinking suppression destroys research ability for this model. |
+| **qwen36-27b** | **0.781** | 404s | 8a/1s/2w/6f | Solid mid-tier research. Coverage 0.8, impl depth 5/5, hallucination 0.0, citations 6/6 valid. Found ROCKET→MiniRocket→S-Rocket→POCKET→R-Clustering lineage. 8 sources, 33 model sources matched to 41 reference sources (0.353 Jaccard). Fast at 404s — ~4x faster than step37 thinking mode. |
+
+**Takeaway for thinking models:** Running the research benchmark with a template that suppresses thinking is not just worse — it's catastrophic. The research composite drops from 1.035 (record) to 0.160 (worst recorded). This is a different failure mode from coding: for research, the model's reasoning IS the product. Don't benchmark thinking models for research without enabling their thinking mode.

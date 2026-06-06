@@ -10,8 +10,8 @@ Run agentic tool-call benchmarks across all models on the m5-router sequentially
 
 ## Prerequisites
 
-- Benchmark script: `~/llm-server/json_test/run_bench.py`
-- Prompts: `~/llm-server/json_test/prompts.jsonl`
+- Benchmark script: `/mnt/data1/cricri/tools/llm-server/json_test/run_bench.py`
+- Prompts: `/mnt/data1/cricri/tools/llm-server/json_test/prompts.jsonl`
 - Router running: `systemctl --user status m5-router.service`
 - Python `requests` lib on host
 

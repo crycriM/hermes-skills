@@ -56,6 +56,11 @@ Chrome (distrobox Xvfb :99) -> CDP WS :9222 -> daemon.py -> Unix socket -> run.p
 - **Daemon stale socket**: restart with `cd ~/browser-harness && uv run python -c "from admin import restart_daemon; restart_daemon()"`
 - **Chrome profile**: uses /tmp inside distrobox — no persistent cookies. For login-required sites, use a persistent profile dir.
 - **WS URL changes**: the UUID in CDP WebSocket URL changes on Chrome restart. Always discover fresh from localhost:9222/json/version.
+- **Blank page on shared hosting**: WordPress sites on shared hosting (Infomaniak, etc.) may show blank pages in automated browsers. Mitigations:
+  - Add `page.waitForLoadState('networkidle')` before interactions
+  - Try `page.waitForTimeout(3000)` for extra load time
+  - Check if the page loads in a regular browser first
+  - Fall back to REST API or SSH if browser automation fails
 
 ## When to use vs Hermes Playwright
 

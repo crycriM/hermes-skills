@@ -109,20 +109,67 @@ From `transcription_tools.py` `_get_provider()`:
 **Source file location:** `/home/cricri/.hermes/hermes-agent/tools/transcription_tools.py` (556 lines)
 
 ## Voicemail handling
-
+## Voicemail handling
 Long voice transcripts are handled by the `voicemail-handler` skill (dogfood/):
 - Short transcripts (~<100 words): agent responds normally
 - Long transcripts (~100+ words): saved to `~/voicemails/YYYY-MM-DD_HHMM.md`, agent replies with summary + confirmation
 
 No gateway code involved — pure agent-level behavior via skill.
 
-## Whisper-server (optional, not used by pipeline)
+## Integrating whisper.cpp HTTP server (alternative to CLI)
+The whisper.cpp HTTP API server (running on `localhost:9000`) can be used by custom apps that want an HTTP-driven STT integration instead of spawning a subprocess per request.
 
-A whisper.cpp HTTP server may still run on `localhost:9000` as systemd service `whisper-server.service`. This is NOT used by the Hermes STT pipeline (which uses CLI, not HTTP). It may be used by other tools.
+**API shape (whisper-server HTTP API):**
+- URL: `POST http://127.0.0.1:9000/inference`
+- Content-Type: `multipart/form-data`
+- Fields: `file` (audio), `temperature` (0.0), `response_format` (`text`|`json`|`verbose_json`)
+- Returns: JSON with `text` field
 
-Service file: `~/.config/systemd/user/whisper-server.service`
+**python pattern for FastAPI apps:**
+```python
+import httpx, tempfile, os
+from fastapi import APIRouter, HTTPException, UploadFile
+from pydantic import BaseModel
 
+router = APIRouter()
+
+class STTResponse(BaseModel):
+    text: str
+
+@router.post("/api/stt", response_model=STTResponse)
+async def stt_transcribe(file: UploadFile):
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(content); tmp_path = tmp.name
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            with open(tmp_path, "rb") as f:
+                resp = await client.post(
+                    "http://127.0.0.1:9000/inference",
+                    data={"temperature": "0.0", "response_format": "text"},
+                    files={"file": (tmp_path, f, "audio/wav")},
+                )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=resp.text)
+        return STTResponse(text=resp.json().get("text", "").strip())
+    finally:
+        os.unlink(tmp_path)
 ```
+
+**When to use HTTP vs CLI:**
+- HTTP server: keep one warm process, best for apps that need STT repeatedly (web apps, bots). Latency: model stays loaded in memory.
+- CLI subprocess: zero setup beyond binary+model, good for infrequent calls or batch scripts.
+
+**Current state:** HTTP server NOT used by Hermes gateway pipeline (CLI path is active there). But the HTTP server IS used by the Pelemelo task manager project (`/projects/pelemello/`) at `http://127.0.0.1:9000`.
+
+## whisper.cpp HTTP server (used by custom apps)
+Running on `localhost:9000` as systemd service `whisper-server.service`.
+- Used by: Pelemelo task manager (`/projects/pelemello/`) for browser-based STT
+- NOT used by: Hermes gateway pipeline (uses CLI path instead)
+- API: `POST /inference` with multipart audio → JSON with `text` field
+- Start: `whisper-server --model <path> --port 9000 --host 127.0.0.1`
+
+Service file tip: `~/.config/systemd/user/whisper-server.service`
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
 ExecStart=/opt/whisper.cpp/build/bin/whisper-server -m /opt/whisper.cpp/models/ggml-base.bin --port 9000 --host 127.0.0.1 -t 4 -l en
 ```

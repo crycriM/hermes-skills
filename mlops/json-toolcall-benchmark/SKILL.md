@@ -5,19 +5,21 @@ description: Maintain, debug, and extend the agentic tool-call JSON benchmark in
 
 # JSON Tool-Call Benchmark
 
-Location: `~/llm-server/json_test/`
+Location: `/mnt/data1/cricri/tools/llm-server/json_test/`
 
 ## Key Files
 - `prompts.jsonl` — 20 test cases (P01-P20), difficulty 1-4, 11 categories
 - `run_bench.py` — scoring harness (extract_json, score_case, call_model, aggregate)
 - `test_harness.py` — self-test for scoring logic (no network needed)
 - `results_*.json` — per-model results
-
 ## Running
+
 ```bash
 python run_bench.py --endpoint http://localhost:8080/v1 --model <name> --out results_<name>.json
 python test_harness.py  # verify scoring logic after any edit
 ```
+
+**Sequential-only.** Run JSON bench BEFORE coding bench and research bench against the same model. The router can only serve one request stream at a time — concurrent JSON + coding + research calls cause request contention, timeout cascades, and noisy scores. Launch them one at a time and wait for each to finish before starting the next. See coding-benchmark-runner skill for the full sequential workflow.
 
 ## Thinking Model Support
 
@@ -102,6 +104,7 @@ If adding new cases, include this in the system prompt or models will use free-f
 Thinking mode can HURT some models on the JSON bench:
 - **qwen36-35b**: 0.905 → 1.000 when thinking DISABLED (+0.095). Thinking tokens introduced parse failures (P06, P09 had empty output).
 - **holo3-35b**: 0.932 → 0.933 — essentially no change, but P15 (deeply nested) failed without thinking.
+- **step37 (Step-3.7-Flash IQ4_XS)**: Scored 1.000 (perfect 20/20) despite `enable_thinking:false` being silently ignored — the model still produces `reasoning_content` with empty `content`. The JSON bench's `reasoning_content` fallback handles this cleanly, and structured JSON output is unaffected by the thinking artefacts that plague its coding output. However, think-mode artefacts (unterminated string literals, U+2014 em-dash) may appear in prose responses — only function-call format is immune.
 
 Always benchmark both `enable_thinking:true` and `enable_thinking:false` for thinking-capable models.
 
@@ -130,7 +133,9 @@ With n=20 binary pass/fail outcomes, the benchmark CANNOT statistically distingu
 
 ## Thinking Mode Testing
 
-See coding-benchmark-runner skill for the full procedure. Key finding: thinking mode affects JSON scores too — qwen36-35b went from 0.905 (thinking) to 1.000 (no-thinking). Always test both modes for thinking-capable models.
+See coding-benchmark-runner skill for the full procedure including the `reasoning = off` (NOT `none`) pitfall and parent override issue. Key finding: thinking mode affects JSON scores too — qwen36-35b went from 0.905 (thinking) to 1.000 (no-thinking). Always test both modes for thinking-capable models.
+
+**Gemma 4 models:** Use `reasoning = off` in router-preset.ini (not `chat-template-kwargs`). Must also remove global `--reasoning auto` from `start-native-router.sh` — see coding-benchmark-runner for full procedure.
 
 ## Extending
 Add cases by appending to `prompts.jsonl`. Available check types:
@@ -147,7 +152,7 @@ After adding cases, run `test_harness.py` to verify.
 
 ## Running All Models (run_all_benches.py)
 
-The `run_all_benches.py` script benchmarks all models sequentially via the router.
+The `run_all_benches.py` script benchmarks all models sequentially via the router at `/mnt/data1/cricri/tools/llm-server/json_test/`.
 Update the MODELS list from `~/llm-server/router-preset.ini` sections whenever models change.
 
 ```bash

@@ -82,11 +82,43 @@ The skill handler should:
 3. Run the appropriate `add.py` command via terminal
 4. Parse output and reply with terse confirmation
 
+## Twitter/X Ingestion
+
+X API requires paid credits (CreditsDepleted error). Use MCP web-reader instead:
+
+1. Fetch tweet content: `mcp_web_reader_webReader(url="https://x.com/i/status/...", retain_images=false)`
+2. Extract the content from the returned JSON (under `content` key)
+3. Clean up escaped characters and write to temp file
+4. Ingest: `cd ~/supertank && ~/llm-server/venv/bin/python3 scripts/add.py /tmp/tweet_<id>.txt --keywords kw1,kw2`
+
+The MCP web-reader bypasses both the X API paywall and client-side rendering. Returns full article/thread text in a single call. Works for threads and long-form tweets.
+
+xurl is installed (`~/.local/bin/xurl`, v1.1.0) with OAuth2 token stored in `~/.xurl` but xurl binary can't read manually-injected tokens. Workaround: `~/.local/bin/xurl-read` wrapper uses curl directly. See `social-media/xurl` skill for headless OAuth setup notes.
+
 ## Known Issues
 - SSRN blocks curl (Cloudflare). User downloads PDFs manually.
 - RAG service patched: `~/llm-server/rag_service.py` now supports `collection` param on `/add` and `/search`.
 - OCR for scanned PDFs: tesseract installed but not yet wired into extractor.
 - Figure/chart extraction + vision model analysis: phase 2, not yet implemented.
+- xurl token stored in `~/.xurl` but xurl binary can't read manually-injected OAuth2 tokens — use `xurl-read` wrapper or curl directly.
+
+## Twitter/X ingestion
+
+Due to client‑side rendering, the default `curl+BS4` extractor cannot retrieve tweet text. Use the official `xurl` CLI to fetch the tweet and pipe it into Supertank:
+
+```bash
+# 1. Ensure xurl is installed and authenticated (see the xurl skill)
+# 2. Fetch tweet text (replace <TWEET_URL> with the actual tweet URL)
+xurl read <TWEET_URL> | jq -r '.data.text' | \
+  ~/supertank/scripts/add.py --stdin --keywords twitter,<topic>
+```
+
+Notes:
+- The `--stdin` flag tells `add.py` to read from standard input.
+- You can add additional keywords as needed.
+- If you only need the tweet ID, you can also use `xurl read <TWEET_URL>` and extract the `id` field for metadata.
+
+This workflow bypasses the JS limitation and stores the tweet as a regular Supertank entry.
 
 ## First Entry
 Dean 2026 "Scale Invariant Dynamics in Market Price Momentum" — 24pp, 63 chunks in ChromaDB.
