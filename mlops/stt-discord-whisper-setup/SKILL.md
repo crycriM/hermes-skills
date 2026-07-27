@@ -171,8 +171,54 @@ Running on `localhost:9000` as systemd service `whisper-server.service`.
 
 Service file tip: `~/.config/systemd/user/whisper-server.service`
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
-ExecStart=/opt/whisper.cpp/build/bin/whisper-server -m /opt/whisper.cpp/models/ggml-base.bin --port 9000 --host 127.0.0.1 -t 4 -l en
+ExecStart=/opt/whisper.cpp/build/bin/whisper-server -m /opt/whisper.cpp/models/ggml-small.bin --port 9000 --host 127.0.0.1 -t 4 -l en
 ```
+
+## Post-processing proxy (whisper-proxy)
+
+Whisper-server has **no built-in post-processing** — no grammar files, regex substitution, output filtering, or text normalization. It returns raw model output as-is.
+
+A post-processing proxy sits between nginx and whisper-server to clean up the transcript before returning it to clients:
+
+```
+Client → nginx (:8444/whisper/) → whisper-proxy (:9001) → whisper-server (:9000)
+```
+
+Current post-processing rules (see `references/whisper-proxy.md`):
+1. Filler word replacement — "OM", "Hmm", "Um", "Uh" → "..."
+2. Newline collapse — all internal newlines replaced with spaces (no line breaks within a message)
+
+**Service:** `whisper-proxy.service` (user systemd unit), depends on `whisper-server.service`.
+**Script:** `~/scripts/whisper-proxy.py` — Python FastAPI app using uvicorn + httpx.
+**Python venv:** `~/.local/venvs/whisper-proxy` (uv-managed).
+
+### When to add rules
+
+The `post_process_text()` function applies rules in order: filler → newline collapse → dot cleanup. Add new rules in the function body. Each rule should be a regex or string transformation with a clear comment.
+
+### Pitfalls
+
+- **Proxy is transparent for non-transcription paths** (root `/`, `/load`, health checks) — only `/inference` responses are post-processed.
+- **JSON responses are handled** — the `text` field inside JSON is processed, but `verbose_json` with timestamps is passed through raw.
+
+## Exposing whisper-server remotely (nginx reverse proxy)
+
+Don't bind whisper-server to `0.0.0.0` directly — no auth on the server. Instead, put it behind nginx with basic auth.
+See `references/nginx-whisper-proxy.md` for full config snippets and test commands.
+
+### Quick setup
+
+1. Create htpasswd file: `sudo htpasswd -cb /etc/nginx/auth/stt.htpasswd <user> "<password>"`
+2. Add `auth_basic` + `auth_basic_user_file` to the `/whisper/` location in `~/projects/pelemello/reverse-proxy/nginx.conf`
+3. Add clickable entry to `/var/www/services/services.html` (services portal at `https://<host>:8444/`)
+4. Ensure whisper-server service binds to `--host 127.0.0.1` (not `0.0.0.0`) — nginx proxies to localhost
+5. `sudo nginx -t && sudo nginx -s reload`
+
+### Pitfalls
+
+- **patch tool refuses sensitive system paths** (e.g., `/etc/nginx/sites-enabled/`): write to the actual file (`~/projects/pelemello/reverse-proxy/nginx.conf`) not the symlink.
+- **`/var/www/services/` permissions**: directory may be `root:root 755`; fix with `sudo chmod 775 /var/www/services/ && sudo chown cricri:cricri /var/www/services/`.
+- **whisper-server bound to 0.0.0.0**: defeats nginx auth. Always bind to `127.0.0.1`.
 
 ## Troubleshooting
 

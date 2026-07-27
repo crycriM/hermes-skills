@@ -6,15 +6,16 @@ Usage:
     python3 moon_deezer.py search "daft punk"
     python3 moon_deezer.py playlists "quietus"
 
+    # Build curated playlist by theme
+    python3 moon_deezer.py --moon 192.168.0.172 build "chill electro"
+    python3 moon_deezer.py build --list   # List available themes
+
     # Play (MOON must be reachable via HTTP port 80)
     python3 moon_deezer.py --moon 10.42.0.194 play 1010508322
     python3 moon_deezer.py --moon 10.42.0.194 playlist 14598167261
 
     # Transport control
-    python3 moon_deezer.py --moon 10.42.0.194 pause
-    python3 moon_deezer.py --moon 10.42.0.194 next
-    python3 moon_deezer.py --moon 10.42.0.194 prev
-    python3 moon_deezer.py --moon 10.42.0.194 state
+    python3 moon_deezer.py --moon 10.42.0.194 pause|next|prev|state
 
     # Discovery
     python3 moon_deezer.py discover
@@ -74,6 +75,98 @@ def search_playlists(query: str, limit: int = 10) -> list[dict]:
     url = f"{DEEZER_API}/search/playlist?{params}"
     with urllib.request.urlopen(url) as resp:
         return json.loads(resp.read()).get("data", [])
+
+
+# ═══════════════════════════════════════════════════════
+# Curated artist database for themed playlist building
+# ═══════════════════════════════════════════════════════
+
+ARTIST_DB: dict[str, list[str]] = {
+    "chill electro": [
+        "Ben Böhmer", "Christian Löffler", "Bonobo", "Tycho",
+        "Rival Consoles", "Four Tet", "Jon Hopkins", "Max Cooper",
+        "Lane 8", "Nils Frahm", "Ólafur Arnalds", "Caribou",
+        "Bicep", "Overmono", "Floating Points",
+    ],
+    "deep house": [
+        "Lane 8", "Ben Böhmer", "Yotto", "Marsh", "CRi",
+        "Le Youth", "Jerro", "Elderbrook", "Durante", "Nora En Pure",
+    ],
+    "ambient": [
+        "Nils Frahm", "Ólafur Arnalds", "Max Richter", "Jóhann Jóhannsson",
+        "Hania Rani", "A Winged Victory for the Sullen", "Stars of the Lid",
+        "William Basinski", "Tim Hecker", "Hiroshi Yoshimura",
+    ],
+    "minimal techno": [
+        "Boris Brejcha", "Stephan Bodzin", "Paul Kalkbrenner",
+        "Recondite", "Dominik Eulberg", "Kölsch", "Maceo Plex",
+    ],
+    "electronica": [
+        "Bonobo", "Four Tet", "Caribou", "Floating Points",
+        "Jon Hopkins", "Rival Consoles", "Max Cooper", "Tycho",
+        "Bicep", "Overmono", "Christian Löffler",
+    ],
+}
+
+ARTIST_CACHE: dict[str, int] = {}  # name → Deezer ID
+
+
+def _get_artist_id(name: str) -> Optional[int]:
+    """Resolve artist name to Deezer ID (cached)."""
+    if name in ARTIST_CACHE:
+        return ARTIST_CACHE[name]
+    params = urllib.parse.urlencode({"q": name, "limit": 1})
+    url = f"{DEEZER_API}/search/artist?{params}"
+    with urllib.request.urlopen(url) as resp:
+        data = json.loads(resp.read()).get("data", [])
+        if data:
+            ARTIST_CACHE[name] = data[0]["id"]
+            return data[0]["id"]
+    return None
+
+
+def _get_artist_top_tracks(artist_id: int, limit: int = 8) -> list[dict]:
+    """Get top tracks for a Deezer artist."""
+    url = f"{DEEZER_API}/artist/{artist_id}/top?limit={limit}"
+    with urllib.request.urlopen(url) as resp:
+        return json.loads(resp.read()).get("data", [])
+
+
+def build_playlist(theme: str) -> list[dict]:
+    """Build a playlist from curated artists for a given theme.
+    
+    Returns deduplicated list of track dicts from Deezer API.
+    """
+    if theme not in ARTIST_DB:
+        log.error(f"Unknown theme '{theme}'. Available: {', '.join(ARTIST_DB)}")
+        return []
+    
+    artists = ARTIST_DB[theme]
+    seen = set()
+    tracks = []
+    
+    for name in artists:
+        aid = _get_artist_id(name)
+        if not aid:
+            log.warning(f"Artist not found: {name}")
+            continue
+        top = _get_artist_top_tracks(aid, limit=8)
+        count = 0
+        for t in top:
+            tid = t["id"]
+            if tid not in seen:
+                seen.add(tid)
+                tracks.append(t)
+                count += 1
+        log.info(f"  {name}: {count} tracks")
+    
+    log.info(f"Built '{theme}' playlist: {len(tracks)} tracks from {len(artists)} artists")
+    return tracks
+
+
+def list_themes() -> list[str]:
+    """Return available playlist themes."""
+    return list(ARTIST_DB.keys())
 
 
 # ═══════════════════════════════════════════════════════
@@ -233,8 +326,9 @@ def main():
     parser = argparse.ArgumentParser(description="Search Deezer and play on MOON 390")
     parser.add_argument("--moon", default=None, help="MOON IP address (auto-discover if omitted)")
     parser.add_argument("action", nargs="?", default="discover",
-                        help="Action: discover, search <query>, playlists <query>, play <track_id>, playlist <id>, pause, next, prev, state")
-    parser.add_argument("arg", nargs="?", help="Query or track ID")
+                        help="Action: discover, search <q>, playlists <q>, build <theme>, play <id>, playlist <id>, pause, next, prev, state")
+    parser.add_argument("arg", nargs="?", help="Query, track ID, or theme")
+    parser.add_argument("--list", action="store_true", help="List available themes (with build)")
     args = parser.parse_args()
 
     if args.action == "discover":
@@ -272,6 +366,34 @@ def main():
             print(f"  {i:>2}. {p['id']:>12}  {p['title']}  ({p.get('nb_tracks', '?')} tracks) by {p['user']['name']}")
         return
 
+    if args.action == "build":
+        if args.list:
+            themes = list_themes()
+            print("Available themes:")
+            for t in themes:
+                count = len(ARTIST_DB[t])
+                artists = ", ".join(ARTIST_DB[t][:3])
+                print(f"  {t:20}  {count} artists  ({artists}...)")
+            return
+        if not args.arg:
+            print("Usage: moon_deezer.py build <theme>", file=sys.stderr)
+            print("       moon_deezer.py build --list", file=sys.stderr)
+            sys.exit(1)
+        tracks = build_playlist(args.arg)
+        if not tracks:
+            sys.exit(1)
+        if not args.moon:
+            # Preview only — no MOON specified
+            print(f"\n{'—'*60}")
+            for i, t in enumerate(tracks[:20], 1):
+                dur = f"{t['duration'] // 60}:{t['duration'] % 60:02d}"
+                print(f"  {i:>2}. {t['artist']['name'][:25]:25} — {t['title'][:40]:40}  {dur}")
+            if len(tracks) > 20:
+                print(f"  ... and {len(tracks) - 20} more")
+            print(f"{'—'*60}\n{len(tracks)} tracks ready. Use --moon <ip> build <theme> to queue.")
+            return
+        # MOON specified — fall through to queue below
+
     # All other actions need a MOON IP
     if not args.moon:
         moon_ip = discover_moon()
@@ -297,6 +419,14 @@ def main():
             print("No tracks found in playlist")
             sys.exit(1)
         print(f"Queuing {len(tracks)} tracks...")
+        result = api.queue_tracks(tracks)
+        print(f"Response: {json.dumps(result, indent=2)}")
+
+    elif args.action == "build" and args.arg:
+        tracks = build_playlist(args.arg)
+        if not tracks:
+            sys.exit(1)
+        print(f"Queuing {len(tracks)} tracks to MOON at {moon_ip}...")
         result = api.queue_tracks(tracks)
         print(f"Response: {json.dumps(result, indent=2)}")
 

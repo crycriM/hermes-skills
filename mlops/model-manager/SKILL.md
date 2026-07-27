@@ -2,6 +2,9 @@
 name: model-manager
 description: HTTP proxy (port 8079) fronting llama.cpp router (port 8080) with auto-swap model management on Strix Halo APU.
 tags: [llama-cpp, router, model-management, strix-halo, proxy]
+metadata:
+  hermes:
+    related_skills: [headroom-ai-integration, llama-cpp, router-preset-model-tuning, router-service-recovery, strix-halo-monitoring]
 ---
 
 # Model Manager Proxy
@@ -20,7 +23,41 @@ python3 ~/llm-server/model_manager.py --poll-interval 30  # custom refresh rate
 
 The systemd service (`~/.config/systemd/user/model-manager.service`) now runs with `--verbose` by default. This is required for debugging logit bias application and reasoning enforcement — without it, the most important proxy-level logic is invisible in logs.
 
+### Manual restart pattern (when systemd unit is not loaded)
+
+The systemd `m5-router.service` only manages the **llama.cpp router inside distrobox** — NOT the model-manager proxy. On hosts where `model-manager.service` is not enabled, the proxy runs as a standalone process (typically started by hand). The cleanest restart in that mode:
+
+```bash
+# 1. Find the running PID
+pgrep -f model_manager.py
+
+# 2. Kill it
+kill <PID>
+
+# 3. Wait for the socket to fully release (OSError: [Errno 98] Address already in use trap)
+sleep 2
+
+# 4. Start the new one in the background
+nohup python3 ~/llm-server/model_manager.py --verbose > llm.log.new 2>&1 &
+
+# 5. Verify it bound :8079
+ss -tlnp | grep 8079
+curl -s http://localhost:8079/health
+```
+
+**Race condition warning:** if you skip step 3, the new process may try to bind :8079 while the old one is still in `TIME_WAIT` and fail with `OSError: [Errno 98] Address already in use`. The error is silent at the systemd level — the new process exits with code 1 and nothing else notices. Confirm `ss -tlnp | grep 8079` shows the new PID before declaring success.
+
 No external dependencies. Stdlib only (http.server, http.client, configparser).
+
+## Key fix 2026-06-29: Conservative keep-as-many swap logic
+
+The `ensure_loaded()` method had a critical design flaw: it **unloaded ALL currently-loaded models** before loading a new one, then checked memory. This made it impossible to have 3 models loaded simultaneously even on 128 GB Strix Halo with 84.7 GB of estimated VRAM.
+
+**Old behaviour:** `ensure_loaded("qwen36-35b")` → unload everything → check if 44.6 GB fits → load. Result: only 1 model ever loaded.
+
+**New behaviour:** `ensure_loaded("qwen36-35b")` → calculate `keepers_total + target + 6 GB headroom ≤ 124.5 GB` → keep qwen35-9b (7.7) + qwen36-27b (32.4) → unload nothing → load. Result: all 3 loaded at 84.7/124.5 GB (68%).
+
+The algorithm ranks currently-loaded models by estimated VRAM (largest first), drops the biggest until everything fits, capped at `MAX_CONCURRENT=3` (matches router `--models-max 3`). See `_handle_api_load()` also fixed: uses `get_system_memory()` (same source as `ensure_loaded()`) instead of unreliable per-process `amdgpu_top --process` regex parsing. `SYSTEM_RESERVE_GB` reduced from 10 to 3 GB.
 
 ## How it works
 
@@ -37,13 +74,18 @@ Client → proxy :8079 → router :8080
                 └─ /health               → JSON: proxy + router health check
 ```
 
-### Auto-swap flow
+### Auto-swap flow (three-gate safe)
 
 1. Chat/completion request arrives with `model: X`
-2. Proxy checks if X is already loaded (fast path, no lock contention)
-3. If not loaded: acquires swap lock (serialized — one swap at a time), unloads current model, polls memory until freed, loads X
-4. Forwards the original request to router
-5. If swap fails, returns 503 to client
+2. Proxy checks if X is already loaded (fast path, lock-free read)
+3. If not loaded: acquires swap lock (serialized — one swap at a time)
+   - **Gate 2 (VRAM pre-check)**: if target alone fits in free memory, loads alongside existing models — no eviction
+   - **Eviction path**: only reached when target alone doesn't fit. Ranks loaded models by size, drops biggest first
+   - **Gate 1 (active-slot)**: before unloading any model, queries `/slots` — refuses if any slot is processing
+   - Unloads evicted models, polls memory until freed
+4. **Gate 3 (retry backoff)**: if `/models/load` returns "already running", retries with exponential backoff (1/2/4/8/16/30s) and polls slot state
+5. Forwards the original request to router
+6. If swap fails, returns 503 to client
 
 ### State management
 
@@ -51,6 +93,35 @@ Client → proxy :8079 → router :8080
 - Model state is thread-safe (RLock for reads, Lock for swap serialization)
 - External load/unload operations (via web UI or direct API) are detected on next poll cycle
 - **Known model list is initialized at startup** from the router's response and refreshed every poll, but new `[section]` entries added to `router-preset.ini` are NOT discovered at runtime — only load/unload *status* of already-known models syncs. After adding a new model to the INI, `systemctl --user restart model-manager` is required before the proxy will serve it.
+
+## Design constraints
+
+### `model-manager-config.yaml` is NOT a load list
+
+This config file contains only per-model **reasoning tuning parameters** (`max_reasoning_tokens`, `logit_bias_strength`, `target_thinking_tokens`). It is NOT:
+- A load-on-startup list
+- A preferred-model ranking
+- A list of "models that should always be loaded"
+
+**The only default models are the ones loaded at startup via `load-on-startup = 1` in `router-preset.ini`.** The model-manager has no "primary model" concept and must never acquire one.
+
+Auto-swap in `ensure_loaded()` responds only to:
+1. **Explicit client requests** — a chat completion/tokenize targeting a model not currently loaded
+2. **GUI-driven loads** — the user clicking "load" in the model-manager dashboard (via `/api/load`)
+
+It never proactively loads models at startup, on poll cycles, or based on internal preferences.
+
+### Three-gate swap safety (applied 2026-07-09)
+
+`ensure_loaded()` protects against mid-inference swap crashes with three gates:
+
+1. **Active-slot gate** (`_has_active_slots()`): before unloading any model, queries `GET /slots?model=<name>` on the router. If any slot has `is_processing: true`, the unload is refused and the *new* request fails instead of the running one.
+
+2. **VRAM pre-check**: if `free_memory >= target_model_size + 6 GB headroom`, loads the target alongside existing models without evicting anyone. Only computes keepers/evictions when the target alone doesn't fit.
+
+3. **Retry backoff with slot polling**: after `"model is already running"`, exponential backoff (1s/2s/4s/8s/16s/30s max) and polls the router slot state between retries. Never toggles between loading different models (the death-spiral pattern).
+
+Additionally, `_handle_api_load()` (GUI's `/api/load` endpoint) routes through `ensure_loaded()` for unified protection — GUI-initiated loads benefit from all three gates.
 
 ## Key design decisions
 
@@ -89,12 +160,12 @@ curl -s http://localhost:8079/proxy/status | python3 -c \
 **Endpoint summary:**
 | Endpoint | Target | Purpose |
 |---|---|---|
-| `POST /api/load` | model_manager | Memory-safe model load (unloads others first, polls VRAM) |
+| `POST /api/load` | model_manager | Memory-safe model load via `ensure_loaded()` (three-gate: VRAM pre-check, active-slot gate, retry backoff) |
 | `POST /api/unload` | model_manager | Unload specific model |
-| `POST /models/load` | router :8080 | Raw router load (no memory guard) |
+| `POST /models/load` | model_manager → router | Routes through `ensure_loaded()` via `_handle_model_op` (same three-gate protection) |
 | `GET /proxy/status` | model_manager | JSON state: loaded models, memory, all model sizes |
 
-**Key insight:** Always use `POST /api/load` on the proxy (8079) for memory-safe swapping. Direct router `/models/load` (8080) bypasses the memory guard and can cause OOM.
+**Key insight:** All load paths on the proxy (port 8079) now route through `ensure_loaded()` with the three-gate safety system. Direct router `/models/load` on port 8080 bypasses the memory guard — always use the proxy port for manual loads.
 
 ## Model Manager GUI (`gui_server.py` + `gui/`)
 
@@ -126,6 +197,40 @@ Implementation in `model_manager.py`:
 - Called inside `_handle_api_models()` on every refresh
 - Only loaded models can show as active; unloaded models always return `false`
 
+### Live context usage (used / max)
+
+The `/api/models` response now includes `ctx_used`, `ctx_total`, and `ctx_ts` fields per model. These reflect the **last streaming request's** KV-cache token count as reported by the SSE timings - analogous to the llama.cpp web UI's context display after a completion finishes.
+
+**Important distinction:** `ctx_used` is a **per-request snapshot** (`prompt_n + cache_n + predicted_n` from the last streaming completion), NOT the slot's cumulative KV-cache total. Each new streaming completion overwrites it with that specific request's usage. Between requests, a slot may hold stale KV cache in VRAM that `ctx_used` does not reflect.
+
+In practice: a short 20-token query shows `ctx_used=20` and overwrites a prior 34K-token value. The slot's VRAM-resident KV cache keeps growing across requests because llama.cpp's `n_discard=0` prevents eviction. To see the actual accumulated fill, query the router's slots endpoint: `curl -s http://localhost:8080/slots?model=<name>` and check `n_prompt_tokens` per slot.
+
+**How it works:**
+- During streaming completions, llama-server emits a `timings` object in the final SSE data chunk (same chunk that carries `finish_reason: "length"` or `"stop"`)
+- The proxy's `_proxy_bytes()` calls `_extract_sse_payloads()` on each forwarded chunk to buffer the last SSE data payload, then `_update_context_usage()` after the stream finishes
+- Formula: `ctx_used = timings.prompt_n + timings.cache_n + timings.predicted_n` — matches the llama.cpp GUI's `parseTimingData()`
+- `ctx_total` comes from the INI `ctx-size` (same as the GUI's `getContextTotal()`)
+- Stored in the module-level `SLOT_CONTEXT_USAGE` dict: `{model_name: {ctx_used, ctx_total, ts}}`
+- The GUI renders this as `4.2K / 128K` when `ctx_used > 0`, falling back to the static `ctx_size` value when no streaming completion has happened yet
+
+**Key functions:**
+
+| Function | Role |
+|---|---|
+| `_extract_sse_payloads(chunk, prev) -> bytes` | Stateful line scanner: accumulates incomplete lines across chunks, returns the body of the last `data:` line that isn't `[DONE]` |
+| `_update_context_usage(payload)` | Parses a JSON payload for `timings` + `model`, computes `ctx_used`, stores in `SLOT_CONTEXT_USAGE` |
+| `_handle_api_models()` (enrichment) | For each loaded model with an entry in `SLOT_CONTEXT_USAGE`, adds `ctx_used`/`ctx_total`/`ctx_ts` to the API response |
+
+**Limitations:**
+- Only updated on **streaming** completions (sync completions use `_proxy_sync_with_reasoning_trace` which doesn't track context)
+- Cleared after proxy restart (in-memory only, not persisted)
+- Per-request snapshot, not per-slot cumulative — a slot's VRAM-resident KV cache keeps growing across requests
+- **KV cache accumulation:** With `n_discard=0` (default), llama.cpp slots never evict old cache. A slot used for a 34K-token request retains those tensors in VRAM even after the request ends and a new 20-token request lands on a different slot. Over hours of operation, stale cache can consume significant VRAM without any `ctx_used` field reflecting it. Fix by adding `n-keep`/`n-discard` to each preset section in `router-preset.ini` - see `router-preset-model-tuning` skill's KV cache eviction section for details.
+
+### KV cache occupancy (used context)
+
+The `ctx_size` shown in the GUI is the **configured maximum** (from the INI preset). The router's HTTP API does NOT expose `n_past` (tokens actually in the KV cache per slot) — that data only appears in journal log lines. However, during streaming the SSE `timings` object on the final chunk carries `prompt_n + cache_n + predicted_n` which approximates `n_past` at request-end. See `references/kv-cache-monitoring.md` for the full API gap analysis, llama.cpp GUI internals, journal log format, router logging architecture, and implementation options for surfacing live cache usage.
+
 ### Service management
 
 ```bash
@@ -139,11 +244,14 @@ Restart model-manager (not model-manager-gui) when changing `model_manager.py`. 
 
 - `GET /v1/models` — list models with status (`loaded`/`unloaded`/`loading`/`error`), preset args, architecture
 - `GET /slots?model=<name>` — per-slot state for a loaded model. Each slot has:
+  - `id` — slot number (0-based, per model child process)
+  - `n_ctx` — per-slot max context window (may differ from INI `ctx-size` if overridden)
   - `is_processing` (bool) — true when actively decoding tokens (running inference)
+  - `speculative` (bool) — true if speculative decoding is enabled for this slot
   - `id_task` — task identifier
   - `next_token` — array with `n_remain` and `n_decoded` token counts
   - `params` — full sampler/request parameters
-  - Use this to detect which models are actively running inference without GPU polling
+  - NOTE: `n_past` (tokens in KV cache) is NOT exposed. See `references/kv-cache-monitoring.md`
 - `POST /models/load` — load: `{"model": "name"}` → `{"success": true}`
 - `POST /models/unload` — unload: `{"model": "name"}` → `{"success": true}`
 - `GET /health` — `{"status": "ok"}`
@@ -282,9 +390,152 @@ The startup script validates the preset INI against known llama.cpp options befo
 
     **Detecting CLI flag errors at load time:** Router spawn errors are NOT visible in `journalctl --user -u m5-router` or the model-manager journal. Look in the system journal with:
     ```bash
-    sudo journalctl --since "5 min ago" --no-pager | grep "distrobox" | grep -i "error\|argument\|removed"
+    sudo journalctl --since "5 min ago" --no-pager | grep "distrobox" | grep -i "error\\|argument\\|removed"
     ```
     The `distrobox` prefix in the log line identifies the router's child process. This catches every boot argument error the underlying llama-server emits before crashing.
+
+## Known crash pattern: Auto-swap fires during active inference (mid-inference swap)
+
+The model-manager's auto-swap can trigger while a model is actively processing a client request, causing a full crash sequence with no recovery. This is a design gap in `ensure_loaded()` — it checks model load state but never checks slot activity before deciding to unload.
+
+### Crash sequence (step-by-step)
+
+1. **Model X** is loaded and serving a client request (streaming or sync inference active on one or more slots)
+2. A NEW model load request arrives (via GUI or client chat completion for model Y)
+3. `ensure_loaded("Y")` is called — it triggers auto-swap because Y is not currently loaded
+4. Model-manager **unloads model X** from the router while inference is in-flight on its slots
+5. **Client request to model X fails abruptly** — the backend slot is torn down mid-token
+6. Model-manager sends `load` for model Y → **`400: model is already running`** — the router slot hasn't been freed yet because the child process is still cleaning up
+7. **Retry death spiral begins**: model-manager retries immediately (~1s gap), fails with same error, then toggles between trying Y and re-trying X, all failing with "model is already running"
+8. Model-manager eventually exits or crashes, leaving the router and proxy in an inconsistent state
+
+### Root causes (three distinct bugs)
+
+| # | Bug | Detail |
+|---|-----|--------|
+| 1 | **Swap during active inference** | `ensure_loaded()` checks `loaded_models` set but never queries `GET /slots?model=<name>` to see if any slot has `is_processing: true`. A model with active slots should never be unloaded. |
+| 2 | **No VRAM sufficiency pre-check** | The swap algorithm should first ask: "does the target model alone fit in the available free memory?" If yes, load it without unloading anything. Only start evicting when the target alone *wouldn't* fit. |
+| 3 | **No retry backoff or drain wait** | After `"model is already running"`, retries are immediate (~1s). Should use exponential backoff (1s/2s/4s/8s max 30s) and poll slot state between retries. |
+
+### Smoking-gun log excerpt (July 9 step37 crash)
+
+```
+08:45:55  Unloading ['step37'] to fit qwen36-35b (keepers: [], est total 35.9/124.5 GB)
+08:45:55  → step37 stream  client=Kilo-Code/7.4.1  sys=4601B  user=1655B  kwargs={"model": "step37", "max_tokens": 32000, ...}
+08:45:59  ERROR Failed to load qwen36-35b: {'error': {'code': 400, 'message': 'model is already running'}}
+08:46:02  Keeping 0 loaded model(s) + step37 (est total 97.3/124.5 GB)
+08:46:02  ERROR Failed to load step37: {'error': {'code': 400, 'message': 'model is already running'}}
+08:46:03  Keeping 0 loaded model(s) + qwen36-35b (est total 35.9/124.5 GB)
+08:46:03  ERROR Failed to load qwen36-35b: [repeated]
+08:46:10  ERROR Failed to load step37: [repeated]
+08:46:17  [service exit]
+```
+
+Note two critical facts: (a) step37 at 97.3 GB alone fits on 124.5 GB — the swap was **unnecessary**, and (b) the model-manager toggles between loading step37 and qwen36-35b without waiting for either to clean up, rapidly cycling until crash.
+
+### How to diagnose a mid-inference swap crash
+
+```bash
+# 1. Check model-manager for swap attempt during active request
+journalctl --user -u model-manager.service --since "30 min ago" --no-pager |
+  grep -E "Unloading.*to fit|Failed to load|model is already running"
+
+# 2. Check router for interrupted proxying
+sudo journalctl --since "30 min ago" --no-pager |
+  grep "distrobox" | grep -E "unload|model is already running"
+
+# 3. Verify the client was mid-request at swap time
+# Look for proxy_reques logs timestamped within 1 second of the Unloading log
+sudo journalctl --since "30 min ago" --no-pager |
+  grep "proxy_reques" | grep -B2 "unload"
+```
+
+### Fixes applied (2026-07-09)
+
+Three gates implemented in `ensure_loaded()`:
+
+1. **Active-slot gate** (`_has_active_slots()`): before unloading any model, queries `GET /slots?model=<name>` on the router. If any slot has `is_processing: true`, the unload is refused and the *new* request (the one that triggered the swap) fails instead of the already-running one. This prevents mid-inference swap crashes.
+
+2. **VRAM pre-check**: if `free_memory >= target_model_size + 6 GB headroom`, loads the target alongside existing models without evicting anyone. Only computes keepers/evictions when the target alone doesn't fit. This prevents the unnecessary-swap scenario where a 97 GB model is unloaded to make room for a 35 GB model on 128 GB of RAM.
+
+3. **Retry backoff with slot polling**: after `"model is already running"`, uses exponential backoff (1s/2s/4s/8s/16s/30s max) and polls the router slot state between retries. Never toggles between loading different models (the death-spiral pattern).
+
+Additionally, `_handle_api_load()` (the GUI's `/api/load` endpoint) was unified to route through `ensure_loaded()` instead of posting directly to the router with its own (weaker) memory check. This ensures GUI-initiated loads benefit from all three gates.
+
+**Reference:** `references/auto-swap-mid-inference-crash.md` — full log timeline from the July 9 step37 crash, router and model-manager journal excerpts, and the KiloCode request that was in-flight at swap time.
+
+## Per-request context compression (headroom-ai)
+
+The proxy has optional per-request context compression using [headroom-ai](https://github.com/chopratejas/headroom). It runs in the `_handle_completion` request path after auto-swap and before the reasoning-budget block, so token accounting reflects the compressed prompt.
+
+**Full implementation recipe lives in the sibling `headroom-ai-integration` skill** — `CompressConfig` fields (v0.24 schema), content router strategies, Python 3.14 install with PyO3 forward-compat, the proxy wiring pattern, and the API drift notes (≤ 0.5 vs v0.24).
+
+Key YAML configuration shape (per model):
+```yaml
+models:
+  qwen36-35b:
+    compression:
+      enabled: true
+      target_ratio: 0.7
+      protect_recent: 8
+      min_tokens: 200
+      compress_user: false
+      exclude_tools:        # added 2026-06-15 — tools whose output is NEVER compressed
+        - terminal
+        - read_file
+        - web_extract
+        - execute_code
+        - browser_snapshot
+```
+
+**`exclude_tools` field** (added 2026-06-15): list of tool/function names whose tool-result messages must never be compressed by headroom. These are merged with headroom's built-in exclusions (`Read`, `Glob`, `Grep`, `Write`, `Edit`, `Bash`) via monkeypatching `headroom.config.DEFAULT_EXCLUDE_TOOLS` at startup. Exclusion happens at the ContentRouter level — matching is against the function name from the `tool_calls` block, not the `tool_call_id` string in the `role: tool` message. See the `headroom-ai-integration` skill for the full internal config.
+        - terminal
+        - read_file
+        - web_extract
+        - execute_code
+        - browser_snapshot
+```
+
+Quick verification: look for the `◈ {model} compression: X → Y tokens (N% saved)` log line. The first call is cold (~14s, HuggingFace tokenizer download); warm-cache calls are <100ms.
+
+**Compression scope on this proxy:** applies to `/v1/chat/completions` only. `/v1/completions` uses the legacy `"prompt"` field, not `"messages"`, so `_compress_messages` silently no-ops on that path. Bias injection and CoT grammar still apply on `/v1/completions`.
+
+24. **Systemd service MUST use venv python, not system Python.** The model-manager systemd service's `ExecStart` must point to `~/llm-server/venv/bin/python3`, NOT `/usr/bin/python3`. The venv has headroom-ai v0.24 installed; system Python 3.11 does NOT. When system Python is used, headroom import fails silently (`except ImportError`) — the proxy starts but compression is always disabled even for models with `compression.enabled: true` in YAML. No error is logged beyond the initial info message at startup. Fix: edit `~/.config/systemd/user/model-manager.service`, change `ExecStart` to venv python, then `systemctl --user daemon-reload && systemctl --user restart model-manager`.
+
+## Request-Level Logging
+
+The model-manager proxy logs one INFO line per `/v1/chat/completions` request after auto-swap and reasoning bias injection, but before forwarding to the router. This captures what the client actually sends — useful for diagnosing parameter overrides from thin ACP clients:
+
+```
+→ qwen36-35b sync  client=Kilo/1.0  sys=12450B  user=832B  kwargs={"model": "qwen36-35b", "temperature": 0.4, "max_tokens": 8192, "stream": false}
+```
+
+Fields:
+- **client**: `User-Agent` header value from the HTTP request. Kilo sets `Kilo/1.0`, Claude Code sets `ClaudeCode/1.0`, curl sets `curl/X.Y.Z`. Falls back to `"unknown"` if absent.
+- **sys=N**: Character length of all `role: system` messages concatenated. Shows the system prompt size.
+- **user=N**: Character length of all `role: user` messages concatenated. Shows the input/context size (rough proxy for prompt cost).
+- **kwargs**: Every JSON key from the request body **except `messages`** — model name, temperature, top_p, max_tokens, stream flag, stop sequences, presence_penalty, etc. Also includes injected params like `reasoning_budget`, `logit_bias` (if the model has `max_reasoning_tokens` in YAML), and `grammar` (for -cot variants). This means the log shows the **final** request body after proxy modifications, not the original client body.
+
+### Using the log to trace client parameter overrides
+
+When debugging whether a client (Kilo Code, Claude Code, Copilot) is overriding router defaults:
+
+1. **View live log**: `journalctl --user -u model-manager -f | grep "→"` — each line shows what the client actually sends.
+
+2. **Compare against router preset defaults** (`~/llm-server/router-preset.ini`): if the client sends `temperature: 0.6` but the preset says `temp = 0.8`, the client is overriding.
+
+3. **Check client config** (`~/.config/kilo/kilo.jsonc`): model blocks with no `options: {}` pass nothing through — the router preset defaults apply. Model blocks with explicit `temperature: 0.4` send that value in the request body, overriding the preset.
+
+4. **Injected params are visible in kwargs**: If you set `max_reasoning_tokens` in `model-manager-config.yaml`, the log shows `reasoning_budget` and `logit_bias` values — confirms the proxy's reasoning guard is active.
+
+5. **Quick validation without live traffic**: Send a test request with a known User-Agent and check the log:
+   ```bash
+   curl -s -X POST http://localhost:8079/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -H "User-Agent: test-harness/1.0" \
+     -d '{"model":"qwen36-35b","messages":[{"role":"user","content":"hi"}],"temperature":0.3,"max_tokens":10,"stream":false}' > /dev/null
+   journalctl --user -u model-manager -n 1 | grep "→"
+   ```
 
 ## Structured CoT (Chain-of-Thought) Grammar Injection
 
@@ -377,7 +628,37 @@ curl -s --max-time 20 http://127.0.0.1:41707/v1/chat/completions \
 
 **Key insight:** If the direct backend works but the proxy fails, the issue is in model_manager.py proxy layer. If both fail, the backend llama-server itself has a problem (still loading, crashed, wrong port).
 
-17. **Chunked proxy bug pattern**: If the OpenAI SDK throws `APIConnectionError: Connection error` / `RemoteProtocolError: peer unexpectedly closed connection` when hitting the proxy, but `curl` to the backend llama-server works fine, the issue is in the proxy's chunked transfer encoding. Check `_proxy_bytes()` for: (a) escaped CRLF strings (`\\\\r\\\\n` produces literal backslash chars instead of CR+LF bytes — need `\\r\\n`), and (b) missing terminal `0\\r\\n\\r\\n` chunk. Both cause the client to hang and then fail when the connection closes. Test with the Python OpenAI client directly: `OpenAI(api_key='no-key-required', base_url='http://localhost:8079/v1').chat.completions.create(...)` — curl alone isn't sufficient because it tolerates broken chunked encoding.
+17. **Chunked proxy bug pattern**: If the OpenAI SDK throws `APIConnectionError: Connection error` when hitting the proxy, but `curl` to the backend llama-server works fine, the issue is in the proxy's chunked transfer encoding. Check `_proxy_bytes()` for: (a) escaped CRLF strings (`\\\\r\\\\n` produces literal backslash chars instead of CR+LF bytes — need `\\r\\n`), and (b) missing terminal `0\\r\\n\\r\\n` chunk. Both cause the client to hang and then fail when the connection closes. Test with the Python OpenAI client directly: `OpenAI(api_key='no-key-required', base_url='http://localhost:8079/v1').chat.completions.create(...)` — curl alone isn't sufficient because it tolerates broken chunked encoding.
+
+17b. **"Context size has been exceeded" is NOT necessarily a real overflow.** The llama.cpp backend returns this generic 500 error for multiple distinct conditions: (a) prompt + max_tokens > n_ctx, (b) slot KV cache is in a transient state during a swap or after a prior partial request, (c) the slot is mid-recovery from a previous failure. **Hermes' compression loop triggers on any "context exceeded" error** — and then fails with "Cannot compress further" because a 1-message fresh session has nothing to compress. This produces misleading errors like `Context length exceeded: 14,772 tokens. Cannot compress further` on a session that has only 1 message, where 14,772 tokens is just the prompt itself (system + tools + user content), not accumulated history.
+
+    **How to tell a real overflow from a transient slot error:**
+
+    1. **Check `state.db` for the session:**
+       ```bash
+       sqlite3 ~/.hermes/state.db "SELECT id, source, model, message_count, input_tokens, started_at FROM sessions WHERE id LIKE '%<session_id>%'"
+       ```
+       If `message_count` is 1 and `started_at` is recent (the cron just started), the error is NOT a real overflow. The cron's session in `state.db` is fresh with `input_tokens=0` and `message_count=1`.
+
+    2. **Cross-reference the proxy journal** for the failing session's timeline:
+       ```bash
+       journalctl _PID=$(pgrep -f model_manager.py) --since "<ts>" --no-pager | grep -E "Pipeline starting|◈ .* compression|◈ .* context:|ERROR Proxy error"
+       ```
+       - If there's no `Pipeline starting:` line for the failing request, the proxy never compressed it (the error came from llama-server directly, then Hermes tried to compress post-hoc).
+       - If `◈ <model> compression: A → B tokens` shows B well below `n_ctx`, compression is working fine and the upstream error is a slot-state issue.
+       - If you see `◈ <model> context: X/131072` with X > 100,000 from a *different* concurrent session, the slot is under contention.
+
+    3. **Check parallel traffic:** grep the journal for `Pipeline starting` lines from OTHER sessions in the same second. The model_manager proxy serializes swaps but concurrent requests on an already-loaded model can hit a slot mid-recovery.
+
+    **The smoking-gun pattern from the 2026-06-16 10:03 cron failure:** a fresh cron session got the error on its first request, while a parallel `bg-review` thread was hammering the same `qwen36-35b` slot with 255-message sessions being compressed from 111K to ~49K tokens. The cron's request hit the slot during a busy-swap window. The cron had nothing to compress (1 message) → Hermes reported "Cannot compress further" → cron job marked error. The bg-review's next retry 5 seconds later succeeded (`journalctl` shows `Pipeline starting: 255 messages, 111581 tokens` at 10:03:38, immediately after the cron failure at 10:03:33).
+
+    **Recommended defenses:**
+
+    - **For cron jobs:** wrap the prompt in a retry loop, OR set `max_compression_attempts: 0` in the cron job's per-model override so Hermes doesn't even try to compress a single-message session. Compression cannot reduce a 1-message conversation, so any compression attempt is wasted work that will fail.
+    - **For recurring transient failures:** `systemctl --user restart model-manager` clears any stale slot state. Safe to do — it just re-fetches the model list and re-establishes connections.
+    - **At the Hermes loop level** (separate fix, not a config): the compression loop in `agent/conversation_loop.py:3045-3051` should special-case `len(messages) <= 1` and skip compression entirely, since there's nothing to compress. This is a real bug in the conversation loop, not a config issue.
+
+    See `references/compression-false-positives.md` for the full 10:03 transcript, parallel `bg-review` log excerpts, and the cron session DB state.
 
 18. **model_manager is a systemd user service** at `~/.config/systemd/user/model-manager.service`. Managed with `systemctl --user start/stop/restart model-manager`. Logs via `journalctl _PID=$(pgrep -f model_manager.py) --since "..."` or `systemctl --user status model-manager`. The router (llama-server) runs inside the distrobox container and logs via distrobox journal — use `sudo journalctl --since "..." --no-pager | grep "distrobox\|reasoning-budget"` for router-level events. Confusing the two log sources leads to "No entries" and wasted time.
 
@@ -625,6 +906,14 @@ The INI-level `reasoning-budget` sampler processes ALL prefill tokens (see `refe
 With `reasoning-budget = 1024`, this fires immediately on any conversation with >1024 thinking tokens in history. The symptom: `reasoning-budget: activated` immediately followed by `budget exhausted, forcing end sequence` at the same timestamp — the model never gets to generate.
 
 **Solution for long multi-turn chats:** Disable `reasoning-budget` in the preset entirely. The per-request `reasoning_budget` API parameter uses the same sampler code so the prefill bug still applies on long conversations. For short/fresh chats it works perfectly. For long chains, model_manager's `max_tokens` (output-only) + `logit_bias` (output-only) remain the bug-free fallback since they only constrain generation tokens, never prefill. The per-request reasoning_budget is the default active mechanism; drop back to bias-only when you see prefill exhaustion on a multi-turn conversation.
+
+## Model Selection for Cron/Automated Jobs
+
+**qwen35-9b is the go-to model for all automated cron jobs.** Use it for any recurring task that involves web scraping, research, summarization, or report generation. It delivers 2-7s API call latency with 95-100% cache hits, handles up to 65k context without compression, and never triggers proxy timeouts.
+
+**Thinking-mode models (qwen36-35b with `enable_thinking:true`) will hang cron jobs.** Context compression and other auxiliary calls generate reasoning tokens before output, causing indefinite hangs. **qwen36-27b** (thinking off) works for low-context tasks but hits proxy 502 timeouts above ~60k tokens.
+
+The full model comparison table with real-world performance data, proxy timeout thresholds, monitoring patterns, and the cronjob provider field quirk is in `references/cron-job-model-selection.md`. That reference is the authoritative guide — update it when new models are added or new failure patterns emerge.
 
 ## Standalone model load testing
 

@@ -68,30 +68,28 @@ moon.set_volume(60)
 
 ### Layer 2: NetAPI (Deezer search + playback)
 ```bash
-# Search tracks or playlists
+# Search
 python3 scripts/moon_deezer.py search "daft punk"
 python3 scripts/moon_deezer.py playlists "quietus"
 
-# Play a single track (auto-plays after queueing)
-python3 scripts/moon_deezer.py --moon 10.42.0.194 play 3135556
+# Build curated playlist by theme (no MOON ip needed)
+python3 scripts/moon_deezer.py build --list                # List themes
+python3 scripts/moon_deezer.py build "chill electro"       # Preview
+python3 scripts/moon_deezer.py --moon 192.168.0.172 build "deep house"  # Queue
 
-# Queue an entire playlist
-python3 scripts/moon_deezer.py --moon 10.42.0.194 playlist 14598167261
+# Play a track or Deezer playlist (auto-plays after queueing)
+python3 scripts/moon_deezer.py --moon 192.168.0.172 play 3135556
+python3 scripts/moon_deezer.py --moon 192.168.0.172 playlist 14598167261
 
 # Transport control
-python3 scripts/moon_deezer.py --moon 10.42.0.194 pause
-python3 scripts/moon_deezer.py --moon 10.42.0.194 next
-python3 scripts/moon_deezer.py --moon 10.42.0.194 prev
-
-# Player state
-python3 scripts/moon_deezer.py --moon 10.42.0.194 state
+python3 scripts/moon_deezer.py --moon 192.168.0.172 pause|next|prev|state
 
 # Discover MOON on network
 python3 scripts/moon_deezer.py discover
 ```
 
-The MOON must be reachable via HTTP port 80 on the local network.
-The device auto-plays after a track is queued — no explicit play command needed.
+Known MOON IPs: wired `192.168.0.172` (primary, always up), WiFi `192.168.0.180`.
+MOON wired MAC: `10:c3:7b:4c:7c:a2`, WiFi MAC: `50:1e:2d:2e:14:5e`.
 
 ## CLI
 
@@ -107,7 +105,7 @@ python3 moon_control.py mute on | off         # Mute
 ## Files
 
 - `moon_control.py` — Full implementation (MoonDevice, discover, AirableClient)
-- `scripts/moon_deezer.py` — **Deezer search + MOON NetAPI queueing** (single tracks + playlists)
+- `scripts/moon_deezer.py` — **Deezer search + MOON NetAPI queueing** (tracks, playlists, curated themes)
 - `scripts/moonctl.py` — CLI wrapper (argparse-based, async)
 - `scripts/search_deezer.py` — Search Deezer catalog via public API
 - `scripts/arp_capture.sh` — ARP spoof capture of MOON↔gateway traffic via bettercap
@@ -156,6 +154,13 @@ The UPnP control port changes every device restart. Always `discover()`.
 
 Some firmware versions auto-start playback on URI set. Calling `play()` 
 immediately after `set_uri()` may return HTTP 500. Wait 0.5s and check state.
+
+### NetAPI `play` control returns HTTP 500 when already playing
+
+The MOON auto-starts playback immediately after track queueing via NetAPI.
+Calling `{"control":"play"}` when already in `playing` state returns HTTP 500.
+Only `pause`, `next`, `previous` work reliably. For new tracks, just queue —
+no explicit play needed.
 
 ### MOON 390 WPA2 password entry bug
 

@@ -1,7 +1,7 @@
 ---
 name: obsidian-rag
 description: Unified memory system combining Obsidian vault (human-readable notes) with ChromaDB RAG (semantic search). Use for storing facts, project context, and lessons learnt. Automatically retrieves relevant context when needed.
-version: 1.0.0
+version: 1.1.0
 dependencies: []
 metadata:
   hermes:
@@ -38,20 +38,32 @@ Unified memory combining Obsidian vault for human-readable notes with ChromaDB f
 ├── models/              # Model catalog (sub-wiki: index/log/schema)
 ├── skill-graphs/        # Structured decision trees for skills
 ├── raw/                 # Immutable source material
-│   ├── articles/        # Web articles, blog posts
-│   ├── papers/          # Research papers, whitepapers
-│   ├── transcripts/     # Voice transcripts, chat logs
-│   └── assets/          # Images, diagrams, configs
 └── *-tracker.md         # Multi-phase project trackers
 
     │
-    │  vault_indexer.py (indexing) → restart rag-service after!
+    │  vault_indexer.py (indexing, cron: daily 8am)
+    │  session_backfill.py (session indexing, cron: every 6h)
     v
 
 ChromaDB (port 8001)     # Vector embeddings for semantic search
                         # Actual path: ~/llm-server/chroma_db/
-                        # See references/chroma-storage-layout.md for storage hygiene
+                        # See references/chroma-storage-layout.md
+    │
+    │  rag_proxy.py (port 8002) — auto-injects RAG context before LLM
+    │  systemd: rag-proxy.service. Bridges RAG ↔ LLM automatically.
+    v
+
+LLM (port 8080/8079)     # The model sees RAG context in system prompt
 ```
+
+**Services:**
+
+| Port | Service | Systemd unit | Purpose |
+|------|---------|-------------|---------|
+| 8001 | `rag_service.py` | `rag-service.service` | ChromaDB embeddings + semantic search |
+| 8002 | `rag_proxy.py` | `rag-proxy.service` | Smart router: auto-injects RAG context before LLM call |
+
+**Canonical reference:** `~/llm-server/ARCHITECTURE.md` — full system diagram, component catalog, cron jobs, API reference, maintenance procedures. Read this first when debugging or modifying the memory pipeline.
 
 ## Commands
 
@@ -242,7 +254,8 @@ ChromaDB should hold two collections:
 
 | Collection | Content | Purpose |
 |------------|---------|---------|
-| `memory-index` | Curated vault notes (facts, projects, lessons) | High-signal, human-quality knowledge |
+| `documents` | Curated vault notes (facts, projects, lessons) + skill SKILL.md files | High-signal, human-quality knowledge |
+| `skills` | Skill SKILL.md content | Skill content, procedures, configuration |
 | `sessions` | Raw user+assistant exchanges from session JSONL files | Full recall, catches anything not curated |
 
 When querying, search both collections and merge. Curated notes rank higher (already distilled), but raw sessions catch anything that wasn't explicitly written up.
@@ -401,10 +414,36 @@ Use a short summary of the user's message as the query, not the full text.
 
 | Collection | Content | When it helps |
 |------------|---------|---------------|
-| documents | Vault pages + skill SKILL.md files | Skill content, past decisions, technical facts |
-| sessions | Raw session chunks from past conversations | Past debugging sessions, historical decisions |
+| `documents` | Vault pages (facts, projects, lessons, infrastructure) | Past decisions, technical facts, service configs |
+| `skills` | Skill SKILL.md files | Skill content, procedures, configuration |
+| `sessions` | Raw session chunks from past conversations | Past debugging sessions, historical decisions |
 
-Use `collection: "all"` for broad searches, `collection: "documents"` for skill/project context.
+Use `collection: "all"` for broad searches, `collection: "documents"` for curated notes, `collection: "skills"` for skill content.
+
+### Pitfall: Missing Vault
+
+The `~/memory-index/` vault can disappear after system cleanup, drive reorganization, or profile migration. When missing, `vault_indexer.py` silently skips it, leaving the `documents` collection empty. The RAG service still works for skills+sessions, but curated human notes are lost from search.
+
+**Backup locations to check:**
+- `~/memory-index-backup-2026-04-07/` — full backup with index.md, log.md, schema.md, facts/, lessons/, projects/, infrastructure/, models/, skill-graphs/
+- `/mnt/data1/cricri/memory-index` — partial copy from April 2026 (10 files, just facts/lessons/projects)
+
+**Restore procedure:**
+```bash
+# 1. Restore from backup
+cp -r ~/memory-index-backup-2026-04-07 ~/memory-index
+
+# 2. Verify structure
+ls ~/memory-index/index.md ~/memory-index/schema.md ~/memory-index/log.md
+
+# 3. Re-index into ChromaDB
+cd ~/llm-server && ./venv/bin/python vault_indexer.py 2>&1
+
+# 4. Verify documents are searchable
+curl -s -X POST http://localhost:8001/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "M5 router config", "n_results": 2, "collection": "documents"}'
+```
 
 ### Pitfall: Stale Collection References
 

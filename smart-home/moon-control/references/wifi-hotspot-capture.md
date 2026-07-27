@@ -71,6 +71,12 @@ sudo pkill dnsmasq
 sudo ip addr del 10.42.0.1/24 dev wlp195s0
 sudo iw dev wlp195s0 set type managed
 sudo nmcli device set wlp195s0 managed yes
+
+# Clean up NAT rules (flush FORWARD + POSTROUTING, or reboot)
+sudo iptables -D FORWARD -i wlp195s0 -o eno1 -j ACCEPT 2>/dev/null
+sudo iptables -D FORWARD -i eno1 -o wlp195s0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+sudo iptables -t nat -D POSTROUTING -o eno1 -j MASQUERADE 2>/dev/null
+sudo sysctl -w net.ipv4.ip_forward=0
 ```
 
 ## Pitfalls

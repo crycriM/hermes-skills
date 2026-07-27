@@ -134,7 +134,7 @@ curl -s http://<backend-port>/slots | python3 -c "import json,sys; d=json.load(s
 
 # 5. Verify VRAM saturation
 cat /sys/class/drm/card*/device/mem_info_vram_used
-# Total VRAM (512MB on Strix Halo):
+# Total VRAM (128GB unified on Strix Halo — rocm-smi VRAM field underreports):
 cat /sys/class/drm/card*/device/mem_info_vram_total
 ```
 
@@ -156,6 +156,89 @@ systemctl --user restart m5-router.service
 - The specific sync-after-completion signature (`→ model sync` immediately after `◆ model reasoning:`) is the hallmark of OpenWebUI follow-up generation
 
 **Reference:** `references/openwebui-followup-request-flood.md` — full log signatures and timeline from an observed incident on step37.
+
+### Model stuck in "loading" state (zombie child process)
+
+The router reports a model as `"loading"` in `/v1/models` but the child llama-server died immediately. The router never clears the state, leaving a zombie process.
+
+**Symptom:**
+```bash
+curl -s http://localhost:8080/v1/models | jq '.data[] | select(.status.value == "loading")'
+# Shows model with status "loading" but no active child process
+
+ps aux | grep defunct
+# Shows zombie: [llama-server] <defunct>
+```
+
+**Root cause:** The child llama-server failed to load the model (e.g., unsupported architecture, corrupted GGUF, missing file) and exited immediately, but the router didn't reap the zombie or clear the "loading" state.
+
+**Diagnosis:**
+```bash
+# 1. Check for zombie child processes
+ps aux | grep defunct | grep llama-server
+
+# 2. Get the real error from router logs (DO THIS FIRST)
+journalctl --user -u m5-router.service --since "30 min ago" --no-pager | grep -E "error|fail|unknown"
+
+# 3. Look for the specific model's load attempt
+journalctl --user -u m5-router.service --since "30 min ago" --no-pager | grep -A 5 "spawning server instance with name=<model-name>"
+```
+
+**⚠️ Workflow pitfall:** Always check journal logs BEFORE guessing at VRAM/memory issues. On unified memory systems (128GB Strix Halo), rocm-smi's VRAM field underreports — don't assume OOM when the real error is "unknown model architecture" or similar.
+
+**Common causes:**
+- **Unsupported model architecture**: GGUF declares `general.architecture = X` but llama.cpp doesn't support it yet. Example: `deepseek4` (not in llama.cpp b9741, which only supports `deepseek`, `deepseek2`, `deepseek2-ocr`, `deepseek32`). Check for active PRs on llama.cpp GitHub.
+- **Corrupted GGUF**: Partial download, checksum mismatch
+- **Missing split file**: Multi-part GGUF missing one of the parts
+
+**Checking architecture support:**
+```bash
+# Check what architectures the current build supports
+cd ~/sources/llama.cpp  # Host source, not distrobox
+grep "LLM_ARCH_" src/llama-arch.cpp | grep -E "^\s*\{ LLM_ARCH_"
+
+# For unreleased architectures, check PRs
+curl -s "https://api.github.com/search/issues?q=repo:ggml-org/llama.cpp+<arch_name>+is:pr&sort=created&order=desc" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(f'PR #{i[\"number\"]}: {i[\"title\"]} - {i[\"state\"]}') for i in d.get('items',[])[:5]]"
+```
+
+**Building from a PR branch:**
+```bash
+cd ~/sources/llama.cpp
+git fetch origin pull/<PR_NUMBER>/head:pr-<PR_NUMBER>-<name>
+git checkout pr-<PR_NUMBER>-<name>
+git submodule update --recursive
+
+# Build in distrobox using host source
+distrobox enter llama-vulkan-amdvlk -- bash -c '
+cd /run/host/home/cricri/sources/llama.cpp && \
+cmake -S . -B build -G Ninja \
+  -DGGML_VULKAN=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_RPC=ON \
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=ON \
+  -DLLAMA_BUILD_SERVER=ON && \
+cmake --build build --config Release && \
+cmake --install build --config Release
+'
+```
+
+**Reference:** `references/vulkan-op-support-check.md` — systematic technique for verifying Vulkan backend support for new model architectures.
+
+**Recovery:**
+```bash
+# Restart the router to clear zombie and stale loading state
+systemctl --user restart m5-router.service
+
+# Verify the model is gone from loading state
+curl -s http://localhost:8080/v1/models | jq '.data[] | select(.status.value == "loading")'
+```
+
+**Prevention:**
+- Check llama.cpp release notes for supported architectures before downloading new models
+- Verify GGUF architecture field: `python3 -c "import struct; f=open('<gguf>','rb'); f.read(4); struct.unpack('<I',f.read(4)); struct.unpack('<Q',f.read(8)); n_kv=struct.unpack('<Q',f.read(8))[0]; [print(f.read(struct.unpack('<Q',f.read(8))[0]).decode()) for _ in range(min(n_kv,10))]"`
+- For multi-part GGUFs, verify all parts exist before adding to preset
 
 ### Verification
 - Check logs: `journalctl -u m5-router.service -f`
