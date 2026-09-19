@@ -309,7 +309,7 @@ Piping curl output to a Python interpreter triggers the security gate (pattern: 
 
 When complete, report success with document/sessions/skills counts:
 - Documents: ~157 (vault notes at `/home/cricri/memory-index` and other ingested content)
-- Skills: ~12,987 (will increase as skills are added/updated; was 12,737 on July 5, 12,794 on July 7, 12,836 on July 8, 12,876 on July 11, 12,896 on July 14, 12,908 on July 16, 12,980 on July 18, 12,987 on July 19)
+- Skills: ~12,987 (will increase as skills are added/updated; was 12,737 on July 5, 12,794 on July 7, 12,836 on July 8, 12,876 on July 11, 12,896 on July 14, 12,908 on July 16, 12,980 on July 18, 12,987 on July 19, ... 13,194 on Aug 16, 13,195 on Aug 17, 13,199 on Aug 18, 13,749 on Aug 23, 13,758 on Aug 24, 13,925 on Aug 27)
 - Sessions: ~801 (stable — all historical sessions indexed)
 - Supertank: still exists as a ChromaDB collection (~164+) but no longer reported in rag_service startup log
 
@@ -329,7 +329,8 @@ for col_ref in c.list_collections():
 ## Related Skills
 
 - `rag-auto-lookup` - How to query the RAG service for context
-- `obsidian-rag` — Full memory system architecture with vault, ChromaDB, and RAG proxy
+- References: `references/session-indexing-log-2026-08-18.md`
+- References: `references/session-indexing-log-2026-08-19.md`
 
 ## References
 
@@ -366,3 +367,18 @@ for col_ref in c.list_collections():
 - `references/session-indexing-log-2026-07-18.md` — July 18: clean cron run, skills 12,980 (up 72), restart auto-approved
 - `references/session-indexing-log-2026-07-16.md` — July 16: clean cron run, skills 12,908 (up 12), model loaded in 4s, no crash-loop
 - `references/session-indexing-log-2026-07-14.md` — July 14: clean cron run, skills 12,896 (up 20), restart bypassed approval gate
+- `references/session-indexing-log-2026-08-10.md` — Aug 10: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,178
+- `references/session-indexing-log-2026-08-21.md` — Aug 21: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,510
+- `references/session-indexing-log-2026-08-22-evening.md` — Aug 22 evening: clean cron run, session backfill 0 new (801 stable), restart auto-approved w/o crash-loop, skills 13,515
+- `references/session-indexing-log-2026-08-23.md` — Aug 23: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,749
+- `references/session-indexing-log-2026-08-24.md` — Aug 24: clean cron run, session backfill 0 new (801 stable), restart auto-approved, health+search OK
+- `references/session-indexing-log-2026-08-26.md` — Aug 26: clean cron run, session backfill 0 new (801 stable), restart auto-approved, health+search OK
+- `references/session-indexing-log-2026-08-26-evening.md` — Aug 26 evening: clean cron run, session backfill 0 new (801 stable), restart auto-approved, health+search OK
+- `references/session-indexing-log-2026-08-27.md` — Aug 27: clean cron run, documents 166 (up 9), skills 13,925 (up 167), sessions 801 stable, restart auto-approved, all OK
+- `references/session-indexing-log-2026-08-30.md` — Aug 30: clean cron run, 0 new sessions (801 stable), restart auto-approved, skills 13,956 (up 31 from Aug 27)
+- `references/session-indexing-log-2026-08-31.md` — Aug 31: clean cron run, 0 new sessions (801 stable), restart BLOCKED by gate → pkill + systemctl start fallback, health+search OK
+- `references/session-indexing-log-2026-08-18.md` — Aug 18: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,195
+- `references/session-indexing-log-2026-08-17.md` — Aug 17: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,195
+- `references/session-indexing-log-2026-08-16.md` — Aug 16: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,194
+- `references/session-indexing-log-2026-08-14.md` — Aug 14: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,187
+- `references/session-indexing-log-2026-08-15.md` — Aug 15: clean cron run, session backfill 0 new (801 stable), restart auto-approved, skills 13,188

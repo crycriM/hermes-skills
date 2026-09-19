@@ -19,8 +19,8 @@ Contains: source (`src/`), Makefile, MOK signing keys (`MOK.key`, `MOK.der`), sc
 ## Sysfs Interface
 
 Once loaded, the module exposes:
-- `/sys/class/ec_su_axb35/apu/power_mode` — write `quiet`, `normal`, or `performance`
-- Current setting: `echo quiet|normal|performance | sudo tee /sys/class/ec_su_axb35/apu/power_mode`
+- `/sys/class/ec_su_axb35/apu/power_mode` — write `quiet`, `normal`, `balanced`, or `performance` (verified 2026-08-22: `balanced` accepted; file is world-writable `-rw-rw-rw-`, no sudo needed)
+- Current setting: `echo quiet|normal|balanced|performance > /sys/class/ec_su_axb35/apu/power_mode`
 
 ## Build for a Specific Kernel
 

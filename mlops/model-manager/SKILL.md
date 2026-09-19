@@ -135,6 +135,28 @@ Additionally, `_handle_api_load()` (GUI's `/api/load` endpoint) routes through `
 
 5. **Connection handling**: ThreadingMixIn with `Connection: close` header. Each request gets its own thread and TCP connection to the router.
 
+## Routing kill-switch (2026-09-19)
+
+A global `ROUTING_ENABLED` flag (module-level in `model_manager.py`) acts as a **kill-switch** to free the M5 for other work on the APU. Exposed via GUI header toggle + `POST/GET /api/routing`.
+
+**When OFF:**
+- Any model-serving path returns **HTTP 404** `{"error":{"message":"Routing is disabled…","type":"routing_disabled","code":404,"serving_disabled":true}}`.
+  Blocked paths: `/v1/*`, `/models/*`, `/tokenize`, `/api/load`, `/api/unload`, `/api/slot-cleanup` (see `_is_model_serving_path()`).
+- **Control endpoints stay live** so routing can be re-enabled: `/health`, `/proxy/status`, `/api/routing`, `/api/gpu`, `/api/models`, `/api/power-mode`.
+- **All loaded models are unloaded** from the router in a background thread (`unload_all_models()`), skipping models with active inference slots (avoiding mid-inference unload crash). Unload runs async so the toggle returns immediately; progress is in logs (`♻ routing disabled: unloaded <model>`).
+- `ensure_loaded()` short-circuits to `False` → **no request can trigger a load**.
+- The poller skips slot-cleanup (which does unload→reload cycles) — a reload would defeat the kill-switch.
+
+**Toggle:**
+```bash
+curl -s -X POST http://localhost:8079/api/routing -H 'Content-Type: application/json' -d '{"enabled":false}'  # disable → 404 + unload-all
+curl -s -X POST http://localhost:8079/api/routing -H 'Content-Type: application/json' -d '{"enabled":true}'   # re-enable
+curl -s http://localhost:8079/api/routing   # GET state: {"routing_enabled": bool}
+```
+GUI: header **Routing ON/OFF** toggle (`gui/index.html`), with `confirm()` before the destructive disable, auto-polls state every refresh, disables model Load buttons while OFF, and greys label to 'Routing off'.
+
+**Pitfall — transient 500 on immediate reload:** right after toggling routing back ON, sending a chat request within ~1s may hit the router while it's still in `loading` state (proxy logs `Loaded <model>` then router returns empty-body 500). Wait for `proxy/status` to show the model `loaded`, or just retry — it settles in 1-2s. Standard router spin-up, not a feature bug.
+
 ## Model Manager API (proxy layer)
 
 The model_manager.py proxy exposes its own load/unload API that handles memory-safe model swapping:

@@ -1,0 +1,11 @@
+[
+  "tests/test_moon.py::test_build_soap_envelope_avtransport",
+  "tests/test_moon.py::test_build_soap_envelope_rendering_control",
+  "tests/test_moon.py::test_make_soap_action_header",
+  "tests/test_moon.py::test_moon_device_get_transport_info",
+  "tests/test_moon.py::test_moon_device_mute",
+  "tests/test_moon.py::test_moon_device_set_volume",
+  "tests/test_moon.py::test_parse_empty_soap_fault",
+  "tests/test_moon.py::test_parse_transport_info_response",
+  "tests/test_moon.py::test_parse_volume_response"
+]

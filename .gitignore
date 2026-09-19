@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+# Hermes runtime artifacts (never commit)
+.archive/
+.hub/
+.locks/
+.curator_*/
+.bundled_manifest*
+.usage.json*
