@@ -219,9 +219,11 @@ sleep 15 && curl -s http://127.0.0.1:8001/health
 **pkill approach with verification (preferred for cron/background):**
 Instead of the multi-step PID-grabbing + lsof dance above, use pkill. But always verify the process actually died — pkill can return exit code -15 (itself terminated) without having killed the target.
 
+**Self-match trap:** `pkill -f "rag_service.py"` matches its own shell command line, so pkill SIGTERMs the shell running it and `terminal()` returns **exit -15 with empty output** — looks like a failure, but the target is usually dead too. Never blindly re-run it; check `ss -tlnp | grep 8001` and `systemctl --user is-active rag-service` first. Use `pkill -f "[r]ag_service.py"` to avoid the self-match.
+
 ```bash
 # Try pkill first
-pkill -f "rag_service.py" 2>/dev/null; sleep 2
+pkill -f "[r]ag_service.py" 2>/dev/null; sleep 2
 
 # VERIFY the process is actually dead — don't assume pkill worked
 if ss -tlnp | grep -q 8001; then
@@ -325,6 +327,11 @@ for col_ref in c.list_collections():
     print(f'{col_ref.name}: {col_ref.count()}')
 "
 ```
+
+- `references/session-indexing-log-2026-09-30.md` — Sep 30: 5 new sessions (22 chunks), sessions 12,916, skills 14,538, documents 166, restart gate BLOCKED → pkill + `systemctl start` (PID 2586555), freshness proven via chromadb get() on all 5 session ids
+- `references/session-indexing-log-2026-09-28.md` — Sep 28: 2 new sessions (5 chunks), sessions 12,836, restart gate BLOCKED → pkill + `systemctl start` (PID 41059), skills 14,538, documents 166, freshness proven via chromadb direct read
+- `references/session-indexing-log-2026-09-27.md` — Sep 27: skills 14,478 (+32), plain `session_backfill.py` indexes JSONL only → 0 new (use `--db --since 1779055200`), sessions 12,782, restart gate BLOCKED → kill MainPID + `systemctl start`
+- `references/session-indexing-log-2026-09-22.md` — Sep 22: 4 new sessions (19 chunks), restart gate BLOCKED again → pkill + `systemctl start`, stale-index verification probe, pkill self-match exit -15
 
 ## Related Skills
 
