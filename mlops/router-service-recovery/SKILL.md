@@ -11,9 +11,10 @@ When `m5-router.service` fails to start, follow these steps:
    ```bash
    journalctl --user -u m5-router.service --since "5 min ago" --no-pager | grep -E "(fail|error|not recognized)"
    ```
-   Two common error types:
+   Three common error types:
    - `failed to parse server config` — orphan line (bare filename without `key = value`) in INI
    - `option 'X' not recognized in preset 'Y'` — key `X` is not a valid `llama-server` CLI flag
+   - `Error: unable to find user <name>: no matching entries in passwd file` — container rootfs overlay is detached (host OOM); the INI is irrelevant here. See the "distrobox enter cannot resolve a user" section in the `router-troubleshooting` skill: restart the container with `podman stop/start`.
 
 2. **Edit `router-preset.ini`**
    - Path: `~/llm-server/router-preset.ini`

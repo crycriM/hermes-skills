@@ -20,6 +20,8 @@ cd ~/llm-server/coding_test && python3 test_harness.py
 
 All 32 assertions must pass before running real benchmarks.
 
+**Interpreter:** on M5, a Hermes shell's `python3` resolves to Hermes's own interpreter, which has no `requests` — every harness dies at import with `ModuleNotFoundError: No module named 'requests'`. Run the benches with `/usr/bin/python3` (2.32.5) or `~/llm-server/venv/bin/python`, never the bare `python3` from a Hermes shell.
+
 ## Known issues & fixes
 
 1. **Python 3.14 multiprocessing**: Python 3.14 defaults to `forkserver` context. The harness uses `mp.set_start_method("fork")` in `main()`, but `test_harness.py` needed the same fix added at module level before importing `run_bench`. If `test_harness.py` fails with `RuntimeError: An attempt has been made to start a new process...`, add `import multiprocessing as mp; mp.set_start_method("fork")` at the top.
@@ -269,15 +271,17 @@ Conclusion: Qwen is better for recurring coding pipelines (faster, more token-ef
 
 - `references/step37-bench-results.md` — step37 (Step-3.7-Flash IQ4_XS) partial results and observations about thinking-mode bleed-through.
 
-## Active models (uncommented in router-preset.ini)
+## Active models (uncommented in router-preset.ini, as of 2026-09-28)
 
-- qwen35-9b, qwen36-27b (MTP), qwen36-35b (MTP)
-- qwen35-122b, qwopus35-27b, carnice-27b, ornsteinV-27b, harmonic-27b
-- holo3-35b, qwopus-moe-35b, carnice-35b
+- qwen38-27b, qwen38-27b-nothink, qwen38-27b-abliterated (embedded MTP head)
+- qwen36-35b (MoE, 3B active), step37 (external MTP draft file)
 - nemotron-120b, nemotron-cascade2-30b
-- glm47-flash, minimax25, mistral4-small-119b, step35-flash
-- gemma4-31b, gemma4-26b-moe
-- step37 (Step-3.7-Flash IQ4_XS)
+- gemma4-31b, gemma4-12b
+- deepseek-v4-flash-0731
+- phi4, llama3-8b (small lanes)
+
+`qwen38-27b` and `qwen36-35b` are the `load-on-startup` lanes; every other section loads on demand
+through the :8079 proxy. The old small `qwen35-9b` lane was removed from the preset on 2026-09-28.
 
 New models must be added to `router-preset.ini` AND the router service restarted (`systemctl --user restart m5-router.service`). Just adding to INI is not enough — the router returns 404 on `/models/load` for unknown models.
 
@@ -309,6 +313,7 @@ New models must be added to `router-preset.ini` AND the router service restarted
 | step37 (thinking corrupt) | IQ4_XS | 0.60 | 0.78 | 0.67 | 0.56 | 0.637 | 155 min |
 | step37 (template fix) | IQ4_XS | 0.87 | 0.69 | 1.00 | 0.39 | 0.755 | 60 min |
 | ornsteinV-27b | Q4_K_M | 0.80* | 0.75* | 1.00* | 1.00* | 0.71* | partial 5/15 |
+| signal-flash (Qwen3.8-Flash 177B MoE, IQ4_XL) | IQ4_XL | 0.87 | 0.77 | 1.00 | 0.69 | **0.832** | 65 min |
 
 Notes:
 - Thinking models (harmonic, step35, step37, minimax, GLM-4) are slow — 100-250s per solve.

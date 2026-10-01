@@ -120,4 +120,4 @@ The compression loop should skip compression for `len(messages) <= 1` sessions s
 - `model-manager` SKILL.md pitfall #17b (cross-reference)
 - `cron-agent` SKILL.md — cron session constraints and error patterns
 - `headroom-ai-integration` SKILL.md — the compression internals that run before the failure
-- `references/cron-job-model-selection.md` — qwen35-9b vs qwen36-35b for cron (qwen36-35b is more prone to this because it's the heavy default model)
+- `references/cron-job-model-selection.md` — which lane to run cron jobs on (the heavy `qwen36-35b` default is more prone to this than a small fast lane was)

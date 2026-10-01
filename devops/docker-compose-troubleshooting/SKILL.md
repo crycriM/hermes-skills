@@ -204,3 +204,36 @@ def hypertable_exists(cur, table_name):
     cur.execute("SELECT 1 FROM _timescaledb_catalog.hypertable WHERE name = %s", (table_name,))
     return cur.fetchone() is not None
 ```
+
+---
+
+## Podman: bricked storage state after an OOM-killed container
+
+**Symptom:** every podman command fails with `invalid internal status, try resetting the pause process with podman system migrate: could not find any running process: no such process`, and `podman system migrate` (the intended fix) **panics** with a nil-pointer in `UnmountContainerImage` instead of repairing anything. `distrobox list/enter` are dead too.
+
+**Cause:** a container was OOM-killed while libpod still records it as running — `state: 3` in `ContainerState` with dead `pid`/`conmonPid` and `mounted: true`. Podman looks for a pause process that no longer exists, then migrate crashes unmounting a storage service that never initialised. A container that is stopped but still flagged `mounted` triggers the same panic.
+
+**Diagnosis (read-only):**
+```bash
+sqlite3 ~/.local/share/containers/storage/db.sql \
+  "SELECT ID, json_extract(JSON,'$.state'), json_extract(JSON,'$.pid'), json_extract(JSON,'$.mounted') FROM ContainerState;"
+```
+Cross-check each pid with `ps -p PID` — any `state=3` whose pid is gone is corrupt state.
+
+**Fix — patch the state JSON directly (back up first):**
+```bash
+cp ~/.local/share/containers/storage/db.sql{,.bak-$(date +%s)}
+```
+Then, for each corrupt container: set `state` to 6 (exited), clear `pid` and `conmonPid`, set `mounted` to false and drop the stale `mountPoint`. Mark stopped-but-`mounted` containers unmounted as well. `podman ps -a` works immediately after.
+
+**Do not delete the container records** — that loses the distrobox config. Patching state is sufficient and non-destructive.
+
+**Prevention:** reconcile stale container state before launching heavy jobs; on OOM-prone machines the killer has taken out a running distrobox more than once.
+
+**After the fix, recreate a lost distrobox from its toolbox image:**
+```bash
+podman pull docker.io/kyuz0/amd-strix-halo-toolboxes:TAG
+distrobox create NAME --image docker.io/kyuz0/amd-strix-halo-toolboxes:TAG -- \
+  --device /dev/dri --device /dev/kfd --group-add video --group-add render --group-add sudo --security-opt seccomp=unconfined
+```
+Recreate rather than migrate: models and databases live on the host, not in the container.

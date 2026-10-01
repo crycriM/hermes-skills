@@ -19,12 +19,10 @@ curl -s --max-time 30 http://localhost:8079/v1/chat/completions \
 
 | Model | Thinking | Context | Speed | Cron Fit |
 |-------|----------|---------|-------|----------|
-| `qwen35-9b` | ❌ off | 65k | Fastest (~2-7s/API call, 95-100% cache) | ✅ **BEST** — handles full research/scraping jobs, never hits proxy timeout |
+| `qwen36-35b` | on, capped by the proxy at 4096 reasoning tokens | 262k | moderate (MoE, 3B active) | ✅ the local lane on :8079 and the `load-on-startup` default — keep the thinking levers above in place |
 | `qwen36-27b` | ❌ off | 131k | Fast (~10-40s/API call) | ⚠️ Use for low-context tasks only — hits proxy 502 at ~60k ctx |
-| `qwen36-35b` | ⚠️ auto | 131k | Slow | ❌ Avoid — thinking hangs compression and auxiliary calls |
-| `qwen36-35b-crown` | ❌ off | 131k | Fast | ✅ Good but must be loaded separately |
 
-**qwen35-9b is now the go-to for automated jobs.** It successfully ran the full Paris music research pipeline (browser scraping 6+ websites, jina_reader extraction, web search, report generation) in 22 API calls with context peaking at 50k — well under the 65k limit. No timeouts, no compression needed, no thinking-mode hangs. The 9B model is fast enough that cache hits stay at 95-100%, keeping latency under 10 seconds per call.
+**The small fast lane is gone.** `qwen35-9b` was removed from `router-preset.ini` on 2026-09-28 (backup: `backups/router-preset.ini.before-9b-removal-20260928-123000`). Its measured record while it existed — the Paris music research pipeline, 22 API calls, context peaking at 50k, 2-7 s per call at 95-100% cache, no compression and no proxy timeout — is the bar any replacement lane has to clear. Automated jobs on the local endpoint now run on `qwen36-35b`.
 
 **qwen36-27b fails above ~60k context.** Real-world threshold confirmed: API call #9 succeeded at 61k ctx (10.5s latency), but API call #10 at similar context timed out 3 times (502 proxy timeout). The model-manager proxy cuts off the backend before llama-server finishes processing the large prompt. Use only for tasks that stay under 40k tokens.
 
@@ -44,7 +42,7 @@ API call failed (attempt 3/3) HTTP 502: timed out
 Fallback to custom/qwen36-35b  ← makes things WORSE (thinking mode)
 ```
 
-**Mitigation:** Use `qwen35-9b` (65k ctx, fast) for all cron jobs. Its per-call latency is 2-7 seconds with 95-100% cache hits, keeping well under the proxy timeout even as context grows.
+**Mitigation:** keep automated jobs on `qwen36-35b` with the thinking cap in place, or on `qwen36-27b` for low-context work, and treat context as the other lever (stay under ~40k tokens for 27B-class lanes). A small, fast lane is what made 50k-context cron runs painless here; if that latency is needed again, add a section back to `router-preset.ini` instead of improvising on a heavy lane.
 
 ## Monitoring Cron Job Progress
 
@@ -74,7 +72,7 @@ grep "<session_id>" ~/.hermes/logs/errors.log
 - `context compression started/done` — compression events
 - `API call failed` — proxy/model timeouts
 
-### Real-world monitoring example (qwen35-9b, successful run)
+### Real-world monitoring example (historical: the retired qwen35-9b lane, successful run)
 
 ```bash
 # Track the run from start to report generation

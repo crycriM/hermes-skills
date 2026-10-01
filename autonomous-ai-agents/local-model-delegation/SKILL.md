@@ -20,17 +20,21 @@ those skills, merge this one's content into them.
 
 ## 1. Which local model to use
 
-The model names kilo can target live under `provider.local.models` in
-`~/.config/kilo/kilo.jsonc` (local provider baseURL = model-manager proxy
-`http://localhost:8079/v1`). Current set (2026-08):
+Targets are whatever `provider.local.models` in `~/.config/kilo/kilo.jsonc` holds — READ
+that file, never trust a remembered list: the local provider gets re-pointed as lanes move
+(model-manager proxy `:8079/v1` for llama.cpp presets, the halogen lane `:8741/v1` for
+`qwen3.8-flash-next-halogen`). The JSON key is the model id kilo resolves; `name` is only
+a display alias. Names seen in the past — verify before use: `qwen38-27b` (THINKING
+variant, **the user's default for implementation delegation**; never substitute `-nothink`
+unless asked), `qwen38-27b-nothink`, `qwen36-35b`, `qwen3.8-flash-next-halogen` (display
+name `qwen38-flash`).
 
-- `local/qwen38-27b` — THINKING variant. **The user's default for implementation
-  delegation** (they corrected mid-session 2026-08-24: "launch session on thinking
-  version of the model" — i.e. NOT `-nothink`).
-- `local/qwen38-27b-nothink` — same weights, reasoning off; clean `content`, thinking
-  in `reasoning_content`.
-- `local/qwen36-35b` — smaller/faster, the kilo default previously.
-- `local/step37`, `local/qwen35-9b` — also present at times.
+**Every custom model entry needs an explicit `limit` block** —
+`"limit": {"context": <the endpoint's real context>, "output": <reservation you accept>}`.
+Kilo otherwise sends `max_tokens: 32000` on every request (hard-coded
+`min(limit.output, 32000) || 32000`) and never arms auto-compaction (`limit.context === 0`
+disables it outright). What that costs, and the trigger arithmetic, are in
+references/kilo-context-compaction.md.
 
 Rule: when the user says "delegate to local model X", use the base name
 (`local/qwen38-27b`), i.e. the thinking variant, unless they say otherwise.
@@ -49,6 +53,11 @@ Smoke-test the model BEFORE the long session (cheap; catches wrong names and swa
 failures):
 `kilo run --model local/qwen38-27b 'Respond with exactly: KILO_SMOKE_OK'`
 → success looks like `> code · qwen38-27b` then the reply.
+
+Address the model as `-m <provider>/<model-key>` with the key from the config (see §1).
+The display-name alias does not resolve in the non-interactive path — a config whose
+`"model"`/`agent.*.model` hold the alias fails with `Model not found: local/<alias>.
+Did you mean: <key>?` even though the interactive TUI resolves it.
 
 ## 3. Switching model variants (thinking vs nothink)
 
@@ -103,9 +112,106 @@ delegate knows nothing of the conversation). Include:
 4. Report open decisions (e.g. "commit the dirty tree to mint the baseline tag?") to
    the user rather than committing uncommitted work yourself.
 
+## 6. When a local child fails or dies mid-run
+
+A long local delegation can end in a provider error after doing most of the work. Two
+failure shapes, both of which look like "the task did nothing" and are not:
+
+- **`HTTP 400: model '<name>' not found`, returned in ~0.1 s with `api_calls=1`** — the
+  configured child model name does not exist on the router (a stale or renamed preset).
+  `delegation.model` / `delegation.provider` / `delegation.base_url` are a pin **separate
+  from `model.default`**, so children can be broken while the parent runs fine. Validate
+  before dispatching: `curl -s http://localhost:8080/v1/models` and compare with
+  `hermes config get delegation.model`; fix with
+  `hermes config set delegation.model <name-from-that-list>` (the patch/write tools refuse
+  `config.yaml` as security-sensitive).
+- **`HTTP 400: model is not loaded`, after a long run** — the router unloaded the model
+  under the child (swap, pressure, another session). Nothing is wrong with the prompt.
+
+In both cases, **inspect the artifacts before re-dispatching**: file size/mtime, grep for
+symbols the task was supposed to introduce, then run the child's own test command yourself.
+A dead child usually leaves most of the implementation on disk and only fails on its
+closing calls — finish the remainder in the orchestrator (cheaper and faster than paying
+for the whole run again). The child's full tool trace, which shows exactly where it
+stopped, is at `~/.hermes/cache/delegation/live/<delegation_id>/task-<n>.log`.
+
+Prefer a pin that the router **already has resident**: a non-loaded pin makes every child
+wait on a fresh load and stacks another large model in RAM, which this user forbids.
+
+## 7. When the local endpoint refuses a request (a 400 from the provider)
+
+A refusal that names the request budget is the CLIENT's sizing problem, not a broken model
+or proxy: both local endpoints reserve `prompt + max_tokens` per request and hard-400 when
+the sum exceeds their context (`max_tokens N does not fit: prompt is P tokens and the
+context is C, leaving room for R`). Do not restart services or reload models for it.
+
+Route to the verbatim error instead of guessing:
+
+- `~/.local/share/kilo/kilo.db` (sqlite; table `message`, the `data` column is JSON) — the
+  assistant row's `error` field carries `data.message`, `statusCode`, `responseBody` and
+  `metadata.url`: the exact endpoint and the provider's own words.
+- `~/.local/share/kilo/log/opencode.log` — `stream error` lines with provider/model and the
+  same message in time order; `pruning ... found pruned=0` lines show what compaction did.
+- To learn what the client SENDS rather than what you assume, run
+  `scripts/echo-openai-server.py` (logs each request's model, `max_tokens`, message/tool counts, the
+  whole key list, and the reasoning family) and point a throwaway config at it with
+  `KILO_CONFIG=<file> kilo run --pure -m ...`. When the field must also be *accepted* by the live
+  endpoint, use the sibling `scripts/logging-pass-through-proxy.py`: same capture, real upstream
+  answering.
+- Validate any config edit with `kilo config check` ("No config warnings.") before
+  restarting the session.
+
+## 8. A client knob is a claim until you capture the request
+
+A UI knob or CLI flag is not evidence that anything reached the model. Measured on Kilo Code CLI
+7.8.1 against a custom `@ai-sdk/openai-compatible` provider: the reasoning-effort picker sent
+**nothing** for every level (`--variant low|medium|high|max`, no variant, a model id Kilo
+recognises, a per-model `options` block — the same body keys every time), so the lane silently ran
+at the server's default. The picker looked like it worked; only the wire showed it did not.
+
+Capture it — both harnesses ship with this skill:
+
+- `scripts/echo-openai-server.py <port> <log>` — answers itself, no GPU cost, proves what the client
+  SENDS.
+- `scripts/logging-pass-through-proxy.py <port> <host:port> <log>` — forwards to the live endpoint
+  and streams the reply back; use it when the question is also "does the server accept it".
+
+Isolate the run from the user's setup: a scratch `kilo.jsonc` whose `baseURL` points at the probe,
+reached via `XDG_CONFIG_HOME=<scratch>` + `KILO_CONFIG_DIR=<scratch>/kilo` + a scratch
+`XDG_DATA_HOME`, launched with `--pure` so their plugins stay out. Nothing of theirs is touched.
+
+Rules that fall out of it:
+
+- **Log the client's key list, not a fixed field list.** A probe that prints only the fields you
+  already know about is how a knob that never arrives gets confirmed as working.
+- **Never advertise a level the endpoint refuses.** Kilo's effort enum includes `max`; a server
+  defining only `none|minimal|low|medium|high|xhigh` answers 400 for it.
+- **Advertising beats hand-configuring.** A client builds per-model options from its catalog entry,
+  so the model has to declare them (Kilo: `reasoning_options` — served via `KILO_MODELS_PATH` /
+  `KILO_MODELS_URL`, or stamped by a config `plugin`'s `config` hook). Deployed here:
+  `~/.config/kilo/models-catalog.json` (models.dev + a `local` provider for the halogen lane),
+  rebuilt by `~/.config/kilo/bin/refresh-kilo-catalog.py`; that lane's engine-side level list is in
+  the `halogen-flash-lane` skill.
+- **An opaque client documents itself in its binary.** `grep -a -o -E '<PREFIX>_[A-Z_]+' <binary> |
+  sort -u` surfaces the env-var surface (that is how `KILO_MODELS_PATH`, `KILO_MODELS_URL` and
+  `KILO_CONFIG_DIR` were found), and grepping a field name near its use shows the wire mapping
+  (`@ai-sdk/openai-compatible` merely renames `reasoningEffort` to `reasoning_effort` and remaps no
+  values). Do this before concluding a facility does not exist.
+- **Client listings are not the request path.** `kilo models --verbose` prints config defaults for a
+  custom provider (`reasoning: null`, a default `limit.output`) even while the wire carries
+  `reasoning_effort`. Only the captured body counts.
+- **Non-interactive shells skip the bottom of `~/.bashrc`.** Debian's guard returns early, so an
+  export below it reaches your terminal and nothing else (Kilo, cron, agent runs). Put it above the
+  guard, and for agent-run `kilo run` add the file to Hermes' `terminal.shell_init_files` or prefix
+  the variable per invocation — `~/.hermes/config.yaml` and `~/.hermes/.env` are not agent-writable,
+  so that hook is the user's to add.
+
 ## Pitfalls
 
-- Model name typos: kilo quietly falls back or errors — run the smoke test first.
+- Model name typos: kilo quietly falls back or errors — run the smoke test first, and for a
+  delegated child validate the configured name against the live router
+  (`curl -s http://localhost:8080/v1/models`); a stale preset name kills every child before
+  its first token and surfaces only in the child's result.
 - Delegates left to their own devices will "just commit" — the no-commit rule must be
   explicit in the prompt, and the operator must flag tag/commit decisions to the user.
 - `kilo run` DIES on permission auto-reject: a single unallowlisted bash command
@@ -131,11 +237,13 @@ delegate knows nothing of the conversation). Include:
   multi-file tasks; use background + notify_on_complete, never block on it.
 - The delegate's tests need the venv with the editable package: run them via
   `/mnt/data1/cricri/projects/volcalibration/skewbik/.venv/bin/python -m pytest <file> -x -q`.
-- Context compaction is NOT task-boundary driven: kilo auto-compacts on token pressure
-  (threshold_percent or the reserved output-cap buffer), mid-task — never explicitly
-  between tasks. On local models the proxy's hard ceiling (~131k) can still kill the
-  run; plan scoped continuations instead of trusting compaction. Mechanics:
-  references/kilo-context-compaction.md (used with the context-ceiling-recovery.md pattern).
+- Context compaction is NOT task-boundary driven: it fires on a single computed trigger
+  (`min(context, context*threshold_percent/100) - reserved`) whenever the model's
+  `limit.context` is known — and never at all when it is 0, which is the state of any
+  custom local entry without a `limit` block. Set the limit, then compaction arms itself
+  mid-task; it still never waits for a task boundary, so plan scoped continuations for
+  >1-module runs. Mechanics: references/kilo-context-compaction.md (used with the
+  context-ceiling-recovery.md pattern).
 - `tee` exit-code trap: launching as `kilo run ... | tee log` means the completion
   notification's "exit code 0" is TEE's, not kilo's (kilo's real exit: 1 = context
   overflow, permission-kill, etc.). A "completed normally 0" proves nothing — verify via

@@ -148,6 +148,34 @@ When the GGUF metadata or model card indicates multimodal/vision capabilities:
    - `tokenizer.ggml.pre = 'pixtral'` — multimodal tokenizer
    - `general.tags` includes `'multimodal'`
    - A separate `mmproj-*.gguf` file exists alongside the model
+   - For Qwen3.5/3.6-family trunks the flags are weaker: the only signals are a
+     `tokenizer.chat_template` containing `image_count`/`video_count` namespaces and a
+     `preprocessor_config.json` in the upstream repo. Hit `--mmproj` at it anyway; if the
+     trunk is text-only llama.cpp errors out at mtmd init.
+
+1b. **Match the projector dimension to the trunk — do this BEFORE editing the preset.**
+   `clip.vision.projection_dim` must equal the text model's `n_embd`. A near-miss (27B
+   tower 5120 vs 35B-A3B trunk 2048) loads the weights then dies:
+   ```
+   E mtmd_init_from_file: error: mismatch between text model (n_embd = 2048) and mmproj (n_embd = 5120)
+   hint: you may be using wrong mmproj
+   ```
+   ```bash
+   gguf-dump --no-tensors trunk.gguf   | grep -E "embedding_length"          # n_embd
+   gguf-dump --no-tensors mmproj.gguf  | grep -E "projection_dim|projector_type"
+   ```
+   Filenames lie: `/home/cricri/models/mmproj.gguf` (0.93 GB, `qwen3vl_merger`) is the
+   **Qwen3.6-27B** tower despite its generic name; the 35B-A3B projector is a separate
+   ~0.90 GB F16 file per repo (e.g. `ggml-org/Qwen3.6-35B-A3B-GGUF`,
+   `unsloth/Qwen3.6-35B-A3B-GGUF`, or the matching fine-tune's GGUF repo). The vision
+   tower is not fine-tuned, so any same-arch mmproj of the right dim works.
+   Cheap differential test (mmap + `-ngl 0`, no 20 GB residency, port 8097) proves the
+   pairing before touching the router: expect `loaded multimodal model` and
+   `/props → modalities {vision:true}`. Real check: POST a solid-colour PNG as
+   `image_url` data URI (`--image-min-tokens 1024` needs adding to KNOWN_KEYS if put in the
+   INI) and read the answer in `message.content` — Qwen3.6 thinking variants put it in
+   `reasoning_content` unless the request sends `chat_template_kwargs {"enable_thinking":false}`.
+
 
 2. **Add the following key** to the preset:
    ```ini
@@ -596,6 +624,21 @@ curl -s http://localhost:8080/health 2>/dev/null || \
 - Verify by extracting the template with `gguf-dump` and checking the generation prompt section
 - Fix: override the template with a modified copy that removes `<think>\n` from `{% if add_generation_prompt %}`
 
+**No-think via `chat-template-file` — keep the parser ON, expect a residual preamble**
+- When the section uses a template that unconditionally emits a think pair (`chat-template-file = chat_template_sharp.jinja` does, at the `add_generation_prompt` branch), disable thinking with `chat-template-kwargs = {"enable_thinking":false}` and KEEP `reasoning = on` + `reasoning-format = deepseek`. The template pre-fills an EMPTY think pair, the model answers immediately, and the parser files that empty block as empty `reasoning_content` instead of leaking tags into `content`.
+- Drop `reasoning-effort`, `reasoning-preserve`, `reasoning-budget`, `reasoning-budget-message` in that case — nothing to preserve or cap once thinking never starts.
+- Do NOT reach for `reasoning = off` on a sharp-template section: the template still emits the pair, so the leftover think text the finetune writes anyway lands RAW in `content`. `reasoning = off` is only clean on sections whose template emits nothing when the flag is false — the shape the retired `[qwen35-9b]` lane had (removed 2026-09-28; no section in the current preset is known to satisfy it, so prove the template's `add_generation_prompt` branch first).
+- Expect a residual 600-900 character preamble in `reasoning_content` before the answer, and do NOT treat it as a misconfiguration: the reference no-think entry shows the same order (621 chars vs 887 on the abliterated twin, same prompt). Verify parity by running the reference section side by side, not by asserting zero reasoning.
+- `reasoning-effort = none` is a valid second lever (the sharp template maps it to thinking off) but is not needed for parity — keep the config identical to the entry you are mirroring so the lanes stay A/B-comparable.
+- `enable_thinking` via `--chat-template-kwargs` still draws a deprecation warning from recent llama.cpp and is still honoured by templates that read it. Keep it: it is the only lever that reaches the template variable.
+
+**Activating a preset edit without cutting a live request**
+- A preset edit is inert until `systemctl --user restart m5-router` (the router caches the INI at boot). Before restarting, poll `/slots?model=<id>` for EVERY loaded model (the bare `/slots` endpoint returns an error object, not a list) and require ~60 s of consecutive quiet — `~/llm-server/restart-router-when-idle.py` implements this (idle window, cmdline snapshot, restart, model-manager restart, unload of the load-on-startup preloads the restart re-created, reload of the target, live-argv checks). Launch it with `terminal(background=True, notify=True)` instead of blocking on a busy lane.
+- The restart re-preloads every `load-on-startup = 1` section (~50 GB for qwen38-27b + qwen36-35b); unload the ones you do not need right after, or `user@1000.service`'s `ManagedOOMMemoryPressure=kill` can SIGKILL the router.
+- Never scope a stop hook by cmdline substring. Container processes live in the CONTAINER's cgroup, not the unit's, so `KillMode=process` cannot reach the router's model instances — but the old hook (`pkill -f llama-server` inside the distrobox) went too wide and killed hand-started standalone lanes as a side effect. Use `~/llm-server/stop-native-router.py` instead (wired as ExecStop, `--force` as ExecStopPost): it identifies the router by argv (`--models-preset`) and signals only the router's own PPID subtree. Model instances ARE direct children of the router PID, so the subtree is the exact set. Dry-run it with `--dry-run` before trusting it; regression test = a standalone lane keeps the SAME pid across a router restart.
+- Standalone lanes (not in the preset: custom builds, prompt-only models) must live in their OWN systemd unit, not a hand-launched process and not the router preset. Two exist: `pe-t2i.service` (9B PE-T2I prompt rewriter, :8090, ~6 GB) and `pe-t2i-35b.service` (Qwen3.6-35B heratic rewriter, :8091, ~22 GB) — both `Type=simple`, `Restart=no`, disabled on purpose (start on demand, `systemctl --user start|stop`), each running a host-side `start-*.sh` that exports `VK_ICD_FILENAMES`/`LD_LIBRARY_PATH` from `/mnt/data2/sources/strix-halo-llamacpp/vulkan` and execs the host `llama-server` (so they do NOT depend on the distrobox container). Ad-hoc lanes for one-off work go through `~/llm-server/start-standalone-lane.sh` (MODEL/PORT/ALIAS/CTX/NVL overrides) — but if a lane is used more than once, promote it to a unit.
+- Both rewrite lanes went `failed`/`inactive` on the router restarts that ran the OLD blanket pkill (they are the bystanders it killed). After that fix, a router restart leaves them running — verify with the dry run, not by assumption, and check `systemctl --user --failed` after any router restart you did not perform yourself.
+
 **Dual-entry preset strategy for per-task thinking switching:**
 When a model needs thinking ON for some tasks and OFF for others (e.g., research needs thinking, coding doesn't), maintain TWO preset entries pointing at the same GGUF file but with different chat templates:
 
@@ -634,6 +677,18 @@ Then load the variant you need per task. See `step37-thinking-suppression` skill
 - SSM state per layer: 128 (ssm_state_size) × float32 × num_layers
 - If VRAM runs out mid-inference, reduce `n-gpu-layers` by 8-16 layers
 - llama-server will CPU-fallback for the rest
+
+**DRY (repetition penalty) must never be a preset default on a tool-calling model**
+- DRY penalises n-grams that recur in the window; an agentic context is almost entirely recurring n-grams (paths, JSON keys, tool names, repeated tool results), so the model escapes the penalty by MUTATING single characters inside otherwise-identical strings instead of stopping. Observed live: `read_file`/`cp`/`vision_analyze` calls on `/mnt/data2/ComfUI/output/...`, `cricric`, `.hermememories` — paths that never existed, so every turn died in a retry loop (34 api_calls for a 223-char answer).
+- Measured causality on this box: 0 such failures in the whole day before DRY went active (preset reload), then 91/84/30 per hour after; A/B asking the model to repeat ONE exact path 10× gave exact=0/10 at `dry-multiplier 0.8` and 10/10 at `0.0`, with a per-request `dry_multiplier: 0.8` control reproducing 0/10 while the preset default (0.0) gave 10/10.
+- Raising `dry-allowed-length` 2 → 8 does NOT fix it: the corruption just moves up a level (`qwen21_qwen21_lig_0001.png`). Only multiplier 0 (off) restored byte-exact output.
+- Rule: ship `dry-multiplier = 0.0` in the preset; enable DRY per request (callers can pass `dry_multiplier`) only for a confirmed prose loop, and gate any multiplier on a 10× exact-repetition test first. Any "duplicate n-gram ratio" metric that measures loop suppression must be paired with an exact-string reproduction test, or it hides this failure.
+
+**Embedded MTP head: `spec-type = draft-mtp` with NO `model-draft`**
+- When the GGUF carries its own MTP/nextn head (`<arch>.nextn_predict_layers >= 1`, check with `gguf-dump --no-tensors <file>`), use it directly: `spec-type = draft-mtp`, `spec-draft-n-max`, `spec-draft-p-min`. No `model-draft`, no `-draft` cache keys. Precedents in this preset: `[qwen38-27b-abliterated]` (p-min 0.5 / n-max 3, embedded head) and `[step37]` (p-min 0.5 / n-max 3, plus its own external MTP file).
+- **Measure acceptance, don't assume it**: every generation response carries `timings.draft_n` and `timings.draft_n_accepted` (read through the model-manager proxy too, non-stream). `draft_n > 0` with no `model-draft` in the section is PROOF the embedded head is speculating. The router's `/v1/models` does not always expose child argv, so don't rely on it to confirm spec args.
+- **Higher acceptance ≠ faster.** Measured on the same prompt, same box (2026-09-27, 3 models + ComfyUI resident — absolute tok/s depressed, ratios meaningful): abliterated 27B + own MTP head n-max 3 → 23.5 tok/s at 80% acceptance; its non-abliterated twin + DFlash2 `model-draft` n-max 4 → 28.0 tok/s at 71%. Block drafting wins on tokens verified per step even at lower acceptance. Also: acceptance falls with output length (80/71% on ~200-token answers → 59/53% on 600) — `spec-draft-p-min` is the knob that stops low-confidence drafting on long outputs.
+- **MoE vs dense dominates everything else**: on the same box and prompt, a 35B MoE with 3B active runs 58-61 tok/s — ~2.7x the dense 27B with either spec scheme. When choosing a model for a lane, active parameters outweigh speculative decoding.
 
 **Speculative decoding argument is `--draft`, not `--spec-draft-n-max`**
 - The correct llama-server argument is `--draft` (or `--draft-max`), NOT `--spec-draft-n-max`
@@ -696,6 +751,7 @@ Then load the variant you need per task. See `step37-thinking-suppression` skill
 - The host-side binary at `~/bin/llama-server` may have library linking issues — use the distrobox one
 
 **Zombie llama processes from killed `distrobox-enter` sessions**
+- `systemctl --user restart m5-router` runs `ExecStop: distrobox enter llama-vulkan-amdvlk -- pkill -TERM -f llama-server`, which is pattern-based and kills EVERY process whose cmdline contains `llama-server` — including orphaned standalone llama-servers someone started by hand on other ports (8090/8091 in the pe-t2i / pe-heretic35b case), and including the agent's own shell command if that command line happens to contain the literal string (the terminal call dies with SIGTERM). Save the cmdlines of any extra servers (`ps -o cmd= -p PID > file`) before restarting, and use a dodge like `pgrep -af 'llama[-]server'` in inspection commands.
 - When a `distrobox enter llama-vulkan-amdvlk -- llama-cli ...` session is interrupted (timeout, Ctrl+C, Hermes tool timeout), the `distrobox-enter` wrapper may die but the **child llama process inside the container can survive**, still holding model weights in memory and pegging a CPU core at 98-99%.
 - The conmon/podman wrapper also survives, making the zombie invisible to `pkill -f distrobox`.
 - Symptom: APU/GPU at 100% with no obvious llama process in `ps aux | grep llama` (or many llama-cli processes that the user can see).
@@ -710,6 +766,61 @@ Then load the variant you need per task. See `step37-thinking-suppression` skill
   systemctl --user restart model-manager   # re-fetches model list from router
   ```
 - The proxy's background poll (every 10s) syncs load/unload *status* of known models but does NOT discover new model entries.
+
+## Sampler/config faults that masquerade as "model too quantized"
+
+When a lane produces mangled exact strings (file paths, identifiers, code) the instinct is
+"upgrade the quant". Measure the serving config FIRST — two settings on this box reproducibly
+destroy exact-string output regardless of quant (the first is the one that ships as a default):
+
+1. **DRY as a preset default — the primary killer.** See the rule above, "DRY (repetition
+   penalty) must never be a preset default on a tool-calling model": an agentic context is almost
+   entirely recurring n-grams (paths, JSON keys, tool names, repeated tool results), so DRY makes
+   the model mutate single characters *inside* otherwise-identical strings instead of stopping.
+   A single-shot probe **understates** this and must not be trusted: copying 3 distinct paths once
+   each gave 0/2 exact at `dry-multiplier 0.8` but 2/2 at `dry-allowed-length 8`, while the 10×
+   single-path repetition test still corrupts at `allowed-length 8`
+   (`qwen21_qwen21_lig_0001.png`). Only `dry-multiplier = 0.0` restored byte-exact output.
+   So: ship DRY off, and gate any multiplier on the 10× exact-repetition test, never on a
+   single-shot copy probe (mine passed at length 8 and was wrong).
+2. **model-manager `logit_bias` on the thinking-close token — suspected, then EXONERATED.**
+   `model-manager-config.yaml` (`logit_bias_strength`, `target_thinking_tokens`,
+   `max_reasoning_tokens`) makes model_manager.py inject `reasoning_budget_tokens` **and** a
+   positive bias on the close token (id from `resolve_thinking_close_token`, e.g. 248069 for
+   qwen36-35b). Proportional: with `max_tokens <= budget`, `(1 - max_tokens/budget) * strength`;
+   above, `max(strength*0.15, strength*target/max_tokens)`.
+   This was blamed for decapitating short answers (content truncated to
+   `'/mnt/data2/ComfyUI/output/0078_l'`; a `'OK<｜end▁of▁thinking｜>…'` close-token loop). **With DRY off
+   it does not reproduce:** on the live DRY-off instance, exact-string fidelity held at applied
+   bias **9.21** (`max_tokens 900`), **10.65** (400), **11.22** (200) and **11.62** (64), on
+   2-path and 3-path prompts (including a 90-char `.gguf` name, dots/dashes/underscores), thinking
+   both off and on. The original truncation/loop was DRY-era: those probes ran against a router
+   instance still carrying `dry-multiplier = 0.8`.
+   **So do not lower `logit_bias_strength` for fidelity** — it is benchmark-validated at 11.8
+   (qwen36-35b coding bench pass@1 = 1.00). Reopen only against a repro on a DRY-off instance.
+
+**Attribution recipe (always run both endpoints + a control model + the LIVE instance args):** the
+router on :8080 applies the preset only; the proxy on :8079 applies the preset *plus* model-manager
+injection. Send the identical request to both, and to an unrelated loaded model through the proxy.
+If the control model is exact and :8080 is exact while :8079 is not, the fault is the injection — not
+the GGUF, not the quant, not the router. **Before attributing anything to a sampler param, read the
+args of the instance that is actually serving** (`curl -s :8080/v1/models`) and confirm which
+non-defaults are live: twice on 2026-09-26 a probe run against a router instance still carrying an
+old `dry-multiplier` produced a confident, wrong root cause (first "raise dry-allowed-length", then
+"lower logit_bias_strength"). A preset edit is not live until the router restarts — check
+`ActiveEnterTimestamp` against the INI's mtime before you believe your own measurement.
+
+## Router restarts and memory pressure (Strix Halo)
+
+Every `systemctl --user restart m5-router` re-preloads **all** sections with
+`load-on-startup = 1` — currently two (`qwen38-27b` 20.9 GB + `qwen36-35b` 29.2 GB ≈ 50 GB). Add a
+third heavy lane while those stand (e.g. deepseek-v4-flash) and the box goes past ~110 GB used /
+12 GB available, where `user@1000.service` carries
+`ManagedOOMMemoryPressure=kill` — the router (and any in-flight long request) then gets SIGKILLed
+with `code=killed, status=9/KILL` in the journal and **no kernel OOM line**. After every restart:
+check `free -g`, then `POST :8079/api/unload {"model":"..."}` for the sections you did not need.
+Swap size matters here: moving a lane from a 21.7 GB Q4 to a 29.2 GB Q6 adds 7.5 GB to every
+preload.
 
 ## Verification
 

@@ -12,14 +12,14 @@ Diagnose and prevent complete system lockups caused by LLM model stacking, memor
 
 A complete system freeze (mouse/keyboard/SSH all dead, hard reset required) requires four conditions:
 
-1. **3+ LLM models loaded** — each model allocates TTM-pinned GPU memory that's invisible to `ps`/`free`. The GGUF file size is not the real cost — see TTM section below.
+1. **The APU already committed to a big resident consumer, plus one more load** — each model allocates TTM-pinned GPU memory that's invisible to `ps`/`free`. The GGUF file size is not the real cost — see TTM section below. The resident consumer does not have to be an LLM: ComfyUI holding its DiT + text encoder counts, and one 21.7 GB router model loaded on top of it has rebooted this box. Three LLMs is the classic shape, not the threshold.
 2. **No swap** — swap.img or swap partition missing or failed to activate at boot. Without swap, every allocation contention becomes a potential deadlock.
 3. **AMDGPU TTM memory pressure** — GPU VRAM allocation (`amdgpu_ttm_tt_populate`) deadlocks when the kernel tries to page, because the GPU can't release pages without kernel allocations, and the kernel can't allocate because it's waiting for GPU pages.
 4. **High `ttm.pages_limit`** — the kernel param `ttm.pages_limit=32505856` (124 GB) allows the GPU to pin nearly all 128 GB of system RAM, leaving no headroom for the kernel to recover.
 
 The OOM killer fires but can't free enough memory because VRAM-backed allocations (TTM-pinned) don't page. The kernel enters a deadlock where `__alloc_pages_may_oom` is called repeatedly but the only candidate processes are TTM-backed themselves. No panic, no crash dump — just a dead machine.
 
-**Key insight:** stacking 3 models (qwen38-27b + qwen36-35b + qwen35-9b) leaves ~55 GB of free RAM by `free`/`ps` metrics. The real memory pressure comes from TTM-pinned GPU memory that these tools cannot see. The TTM layer can pin up to 124 GB of system RAM (controlled by the kernel boot param `ttm.pages_limit=32505856`), and `ps` RSS values only show the process's userspace resident set — not the GPU-allocated pages.
+**Key insight:** stacking 3 models (qwen38-27b + qwen36-35b + a third lane) leaves ~55 GB of free RAM by `free`/`ps` metrics. The real memory pressure comes from TTM-pinned GPU memory that these tools cannot see. The TTM layer can pin up to 124 GB of system RAM (controlled by the kernel boot param `ttm.pages_limit=32505856`), and `ps` RSS values only show the process's userspace resident set — not the GPU-allocated pages.
 
 ## Diagnostic Workflow
 
@@ -85,6 +85,10 @@ journalctl -b 0 -p err | grep -i "swap"  # "Failed to activate swap" → swap mi
 
 4. **Startup race with swap.img.** If `/swap.img` is on a filesystem that mounts late, swap won't be available at boot. Put swap on the root filesystem partition.
 
+5. **`pkill -f "<pattern>"` matches the command line of the very shell running it.** If the pattern is a substring of your own command (e.g. `pkill -f "models/unload"` issued from a command line that contains that text), it kills your own call and its output is lost. Kill by PID/session_id, or use a pattern that cannot match the invoking shell.
+
+6. **A live agent turn is a model load.** `hermes -p <name> chat -q …`, or a messaging turn on a profile whose `model.provider` is local, pulls that profile's model into the APU — a smoke test is not free. Before using a live turn to check a profile, read its `model.provider` and what is already resident; verify config and skills with introspection that loads nothing (`hermes -p <name> skills list`, `config get`, the toolset resolver) instead.
+
 ## Prevention
 
 1. **Fix swap before stacking models.** Check `free -h` before loading multiple LLMs:
@@ -96,8 +100,12 @@ journalctl -b 0 -p err | grep -i "swap"  # "Failed to activate swap" → swap mi
    grep swap /etc/fstab                # verify fstab entry
    ```
 
-2. **Don't stack 3 big models without swap.** On 128 GB Strix Halo, qwen38-27b + qwen36-35b + qwen35-9b + Chrome + Open WebUI + RAG exceeds the OOM surge threshold. With swap, it's a slow degrade; without swap, it's a hard freeze.
+2. **Don't stack 3 big models without swap.** On 128 GB Strix Halo, qwen38-27b + qwen36-35b + a third lane + Chrome + Open WebUI + RAG exceeds the OOM surge threshold. With swap, it's a slow degrade; without swap, it's a hard freeze.
 
 3. **Monitor memory pressure before adding models.** If free memory < 15 GB and no swap is available, refuse to load another model.
 
 4. **Consider staggering model loads.** A delay between model server starts lets the OOM killer clean up background processes before the next model's VRAM allocation starts.
+
+5. **Never unload an in-use model to free memory — ask first.** Loaded router models may be serving someone's live session, including the agent's own inference if the gateway is pointed at the router. Unloading one to make room for a heavy job tears down what the user is talking through, and they will stop you ("you're running on it now"). Check what is loaded (`curl -s http://127.0.0.1:8079/proxy/status`) and ask which models are safe to drop; do not unload unilaterally.
+
+6. **Rendering and local inference are exclusive.** ComfyUI owns the APU whenever a job is queued or sampling: no router chat model, no PE rewriter (`pe-t2i*`), no second llama-server alongside it. Sequence the work instead — rewrite the prompt, stop the rewriter, then render. The load is easy to trigger by accident because it is implicit: any agent turn whose profile resolves to a local model loads it, so read `model.provider` before running one.

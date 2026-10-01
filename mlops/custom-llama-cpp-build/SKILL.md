@@ -1,7 +1,7 @@
 ---
 name: custom-llama-cpp-build
 description: Build llama.cpp from a vendor fork or unreleased PR for model architectures not yet supported by the installed router binary. Covers fork selection, cmake setup, Vulkan/RADV support for Strix Halo, compile-error patching, and standalone server setup alongside the existing router.
-version: 1.3.0---
+version: 1.4.0---
 ---
 
 # Custom llama.cpp Build
@@ -19,6 +19,10 @@ See `references/laguna-s2-patch.md` for a worked example of patching upstream b1
 See `references/laguna-dflash-decoder-contract.md` for the Laguna DFlash speculative-decoding situation: upstream's merged PR #25165 covers the target architecture **only**; the Laguna-specific DFlash decoder contract (causal attention, per-aux norms, attention gate, pre-norm state capture) lives only on poolside's `laguna` fork and has no upstream PR yet. If your draft GGUF embeds `dflash.decoder_arch = laguna`, you need the fork — generic upstream DFlash runs it with wrong (non-causal) attention.
 
 See `references/qwen4exp-rocmfpx-build.md` for the worked Qwen3.8-Flash-Next (qwen4exp) case: the ROCmFP4 quant fork build (dedicated `llama-vulkan-qwen4` distrobox, `-j8`), the ROCmFP4-fast vs UD-IQ4_XS model files and sizes, MTP spec decoding, and the 6-axis eval battery (perplexity / throughput-vs-depth / VRAM residency / MTP / sanity / agentic).
+
+See `references/strix-halo-toolbox-tags.md` for choosing among the prebuilt kyuz0 ROCm toolbox tags (rocm-10.0-qwen-3.8-flash-next vs rocm-10.0-engramhalo vs rocm-10.0-rocmfpx): engramhalo is the only tag that reads SSD-backed `.hgn` engram files and needs `--lazy-mode on`; plain flash-next has no engram support.
+
+See `references/podman-state-repair.md` for when an OOM-killed or stale distrobox container wedges podman (`invalid internal status ... could not find any running process`, `podman system migrate` panics) — diagnose via the sqlite `ContainerState` table and patch dead-PID rows (back up db.sql first).
 
 ### 1. Find the right source
 
@@ -146,7 +150,75 @@ echo " timeout after 300s"
 exit 1
 ```
 
-### 6. Add preset entry (for documentation)
+### 6. Systemd service (optional)
+
+For production-like deployment, create a systemd user service that launches the server inside its dedicated distrobox. This pattern keeps the server manageable via `systemctl --user` and survives terminal session exits.
+
+Two script patterns exist depending on where the llama-server binary lives:
+
+**Pattern A — Binary on host** (built from source, needs `LD_LIBRARY_PATH`): The start script calls `distrobox enter` from the host, passing `LD_LIBRARY_PATH` and `VK_ICD_FILENAMES`. Use the template at `templates/standalone-start-script.sh`. The systemd service calls this wrapper:
+
+```ini
+[Service]
+Type=simple
+ExecStart=/home/cricri/llm-server/start-<arch>.sh
+```
+
+**Pattern B — Binary inside distrobox** (installed via `make install` or a distrobox-native build): The run script lives INSIDE the distrobox and calls `/usr/local/bin/llama-server` directly (no `distrobox enter` wrapper, no `LD_LIBRARY_PATH` gymnastics). The systemd service uses `distrobox enter` as the launcher:
+
+```ini
+[Unit]
+Description=<Model Name> Standalone Server (ROCm, port <PORT>)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/distrobox enter <distrobox-name> -- /home/cricri/llm-server/run-<arch>.sh
+ExecStop=/usr/bin/distrobox enter <distrobox-name> -- bash -c "pkill -TERM -f 'llama-server.*--port <PORT>' || true"
+ExecStopPost=/usr/bin/distrobox enter <distrobox-name> -- bash -c "pkill -9 -f 'llama-server.*--port <PORT>' || true"
+KillMode=process
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=3
+StartLimitAction=none
+SuccessExitStatus=SIGTERM SIGINT 130 143
+
+[Install]
+WantedBy=default.target
+```
+
+The run script (Pattern B) sets ROCm/Vulkan env vars inside the distrobox where the binary already has its library path resolved:
+
+```bash
+#!/bin/bash
+# run-<arch>.sh — lives inside distrobox, launched by systemd
+set -e
+export HSA_OVERRIDE_GFX_VERSION=11.5.1
+export LD_LIBRARY_PATH=/opt/rocm/core/lib/rocm_sysdeps/lib:/opt/rocm/core/lib
+
+exec /usr/local/bin/llama-server \
+  --host 0.0.0.0 --port <PORT> \
+  -m /home/cricri/models/<dir>/<model>.gguf \
+  -md /home/cricri/models/<dir>/<mtp-file>.gguf \
+  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 \
+  --n-gpu-layers-draft 999 \
+  -fa 1 -ctk f16 -ctv f16 -c 131072 -np 1 --jinja \
+  --temp 0.6 --top-p 0.95 --batch-size 2048 --ubatch-size 1024 --threads 16
+```
+
+Install and enable:
+```bash
+cp ~/llm-server/<arch>.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now <arch>.service
+journalctl --user -u <arch>.service -f  # watch startup
+```
+
+**Note:** The distrobox must already exist before starting the service. `distrobox create` pulls the container image and can take 30+ minutes on a slow connection — this is a one-time setup step that should NOT run as part of the service startup.
+
+### 7. Add preset entry (for documentation)
 
 Add a `[model-name]` section to `~/llm-server/router-preset.ini` with `load-on-startup = 0`. The stock router won't load it, but the config block serves as canonical reference. Annotate with comments noting the custom binary path and port.
 
@@ -164,7 +236,7 @@ Add a `[model-name]` section to `~/llm-server/router-preset.ini` with `load-on-s
   | `--draft-p-min` | `--spec-draft-p-min` |
   `--model-draft` still works (aliased to `--spec-draft-model`). This affects launch scripts, router-preset.ini entries, and any saved examples.
 
-- **Never test large models without unloading others first** — Loading a 69GB model alongside other loaded models (even idle ones) may OOM on 128GB unified memory. Before testing on the production distrobox, unload non-essential models through model-manager. Keep small models Hermes relies on (e.g. qwen35-9b at ~9GB) and unload the rest. Or use a dedicated test port (8090) with a standalone server — this avoids touching the router entirely.
+- **Never test large models without unloading others first** — Loading a 69GB model alongside other loaded models (even idle ones) may OOM on 128GB unified memory. Before testing on the production distrobox, unload non-essential models through model-manager: the router's own preloads (qwen38-27b + qwen36-35b) are ~50 GB on their own. Or use a dedicated test port (8090) with a standalone server — this avoids touching the router entirely.
 - **Kill lingering processes**: After interrupted test sessions, orphan llama-server processes hold the port. Clean up with `pkill -9 -f "llama-server.*port <PORT>"`. A `kill -9` on the tracked background wrapper may NOT kill the detached cmake build — verify with `ps -eo pid,%cpu,comm | grep -E 'cc1plus|cmake|cc1'` and kill the actual compiler PIDs.
 
 - **Use bounded parallelism on the no-swap Strix Halo box** — an unbounded `cmake --build -j` on 32 cores + Vulkan shader compilation (`glslc` spawns)` spiked load to ~85 and **hard-crashed the machine** (no swap, so OOM is fatal — hours of lost work). Always build `-j8` (or fewer) and in the background (`background=true, notify`), watching `free -g` / `/proc/loadavg` during the build. This is true of the production container too — never run `-j` unbounded.

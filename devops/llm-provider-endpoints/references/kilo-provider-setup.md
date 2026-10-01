@@ -28,6 +28,38 @@ The provider id must also appear in `enabled_providers`, or the block is inert.
 Kilo also reads a bare `VAR_NAME` from the environment directly; that is what
 `kilo auth list` reports under "Environment".
 
+## Per-model entry keys that change what gets SENT
+
+A model entry can carry more than `name`: some keys decide what the client puts on the wire, and
+omitting them makes a UI control silently do nothing.
+
+    "models": {
+      "<model-id-as-served>": {
+        "name": "Display name",
+        "limit": { "context": 131072, "output": 16384 },
+        "reasoning": true,
+        "reasoning_options": [ { "type": "effort", "values": ["none", "minimal", "low", "medium", "high", "xhigh"] } ]
+      }
+    }
+
+- **The map key must be the id the endpoint serves, not the display `name`.** A `model` config value or
+  `-m` flag built from the display name fails with `Model not found: <provider>/<display-name>.
+  Did you mean: <real-id>?`, and since it is the config default a bare `kilo run` (no `-m`) dies on it.
+- **`limit` is what reserves output per request and what arms auto-compaction.** With no `limit`, Kilo
+  reserves its 32000 default on every request, and compaction never fires while the context is unknown —
+  both halves are load-bearing. Sizing rules and the 400 they prevent: `halogen-flash-lane` →
+  "Clients must size `max_tokens` to the prompt".
+- **`reasoning: true` + `reasoning_options` is what makes an effort picker send anything.** The variant map
+  is built from this metadata; a custom model without it gets no map, so `--variant low|medium|high`
+  (or clicking the picker) puts NO `reasoning_effort` on the wire and the endpoint quietly stays on its own
+  default. Add the block and `--variant X` arrives as `reasoning_effort: X`.
+- **The client's level vocabulary is not the endpoint's.** Kilo's enum is
+  `none|minimal|low|medium|high|xhigh|max` and the chosen name is sent verbatim, so a level the endpoint
+  rejects is a hard 400 (halogen rejects `max`; `xhigh` is its top). Levels outside the declared `values`
+  are dropped, except ones in Kilo's own default set — declare every level the endpoint accepts.
+- `"variants": {"low": {"body": {...}}}` is not a config key: it reaches the wire as a literal top-level
+  `body` field and does nothing.
+
 ## Verification ladder - stop only when a step fails
 
 Each step proves strictly more than the one before. Do not stop early.

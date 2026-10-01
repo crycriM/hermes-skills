@@ -225,6 +225,7 @@ The cron prompt should be a one-line invocation referencing the SOUL process —
 
 ## Common Pitfalls
 
+- **A `/model` switch inside a chat is a STICKY per-session pin, not a one-off.** "_(session only — add `--global` to persist)_" is misleading: the gateway persists the override in the session store (`gateway_routing.entry_json` → `model_override`, legacy mirror `sessions.json`) and rehydrates it after every restart. A profile whose `model.default` is already correct therefore keeps answering with the old model for days. Diagnose from the profile's `logs/agent.log`: `Rehydrated persisted /model override ...` and `Session model override (fast): config_model=X -> override_model=Y` (healthy turns log `No session model override ... override_keys=[]`), then confirm with `sqlite3 <hermes_home>/state.db "select session_key, entry_json from gateway_routing"`. Clear it with `/new` in that room (session reset writes `model_override=null`) or re-pin with `/model <name> --global`. Fix the config only when the config itself is wrong — otherwise you change nothing.
 - **No fallback provider**: If local router is down, the agent is stuck. Always add at least one cloud fallback.
 - **Delegation model same as parent model on local**: Subagents queue behind parent on the same GPU. Use a different provider for delegation.
 - **Aux models point to unavailable provider**: If the local router is the only provider configured and it's down, vision/compression/session_search all break. Use opencode-go or openrouter for critical aux paths.

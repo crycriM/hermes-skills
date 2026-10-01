@@ -240,6 +240,53 @@ curl -s http://localhost:8080/v1/models | jq '.data[] | select(.status.value == 
 - Verify GGUF architecture field: `python3 -c "import struct; f=open('<gguf>','rb'); f.read(4); struct.unpack('<I',f.read(4)); struct.unpack('<Q',f.read(8)); n_kv=struct.unpack('<Q',f.read(8))[0]; [print(f.read(struct.unpack('<Q',f.read(8))[0]).decode()) for _ in range(min(n_kv,10))]"`
 - For multi-part GGUFs, verify all parts exist before adding to preset
 
+### Router crash-loops because `distrobox enter` cannot resolve a user
+
+**Symptom** — `m5-router.service` restarts every 10s with:
+```
+distrobox[...]: Error: unable to find user cricri: no matching entries in passwd file
+m5-router.service: Main process exited, code=exited, status=255/EXCEPTION
+```
+`stop-native-router.py` then logs `no router (argv contains --models-preset) found — nothing to do`. Every model load fails the same way (startup AND manual), and model-manager shows `Router POST /models/load failed: [Errno 111] Connection refused` + `Failed to load <model>: None`.
+
+**Root cause** — the container's rootfs overlay is mounted only inside the container's mount namespace; the host-side `.../overlay/<id>/merged` dir is empty while libpod still reports `running=true`. Podman's `exec` resolves users by reading `<mountpoint>/etc/passwd`, so every *name* lookup fails even though the file is intact in the overlay `diff` dir. Trigger seen 2026-09-29: a host-wide kernel OOM (global_oom, ComfyUI ~8.5 GB + chrome + 2 router models) killed the podman/conmon parents holding the mounts → detached mounts on **all** long-running containers at once. Containers created after the event are unaffected.
+
+**Diagnosis (30 s)**
+```bash
+# 1. Which running containers lost their rootfs?
+for c in $(podman ps --format "{{.Names}}"); do printf "%-32s " "$c"; \
+  podman inspect "$c" --format '{{.Status}} merged={{.GraphDriver.Data.MergedDir}}'; done
+# moved=<no value>  => detached (fresh containers print a real /overlay/<id>/merged path)
+
+# 2. Confirm it is a name-lookup bug, not a broken passwd file
+podman exec --user 0:0      <ctr> /bin/true   # rc=0
+podman exec --user cricri   <ctr> /bin/true   # rc=255 "no matching entries in passwd file"
+# (the overlay's etc/passwd itself is fine: podman unshare cat .../<id>/diff/etc/passwd)
+
+# 3. Confirm the OOM trigger
+journalctl -k --since "3 hours ago" --no-pager | grep -i "global_oom"
+```
+Do **not** debug `router-preset.ini` for this symptom: the router never reaches preset parsing, so INI/KEY validation is a red herring.
+
+**Fix** — restart the affected container so podman re-mounts the overlay. Never `podman rm` it (the llama.cpp build lives in that overlay).
+```bash
+systemctl --user stop m5-router.service          # stop the crash loop first
+podman stop <ctr> && podman start <ctr>          # remounts overlay, MergedDir returns
+podman exec --user cricri <ctr> whoami           # -> cricri
+distrobox enter <ctr> -- whoami                  # -> cricri
+systemctl --user start m5-router.service
+```
+Restart *every* container reporting `merged=<no value>`; an OOM takes them all down together. Other containers can stay up (their processes keep running off the detached mount) — `browser-use` also hosts a live Chrome session, so restart it only when no browser work is in flight.
+
+**After restart, verify loading worked** (load-on-startup entries take ~30-60 s each):
+```bash
+for i in $(seq 1 60); do curl -s http://localhost:8080/v1/models | python3 -c "
+import json,sys
+print([(m['id'],m['status']['value']) for m in json.load(sys.stdin)['data'] if m['status']['value']!='unloaded'])"; sleep 5; done
+# manual path (GUI / model-manager): curl -X POST :8079/api/load -d '{"model":"<id>"}'
+# end-to-end: POST :8079/v1/chat/completions  (model-manager health: :8079/health -> models_loaded N)
+```
+
 ### Verification
 - Check logs: `journalctl -u m5-router.service -f`
 - Router should show all models in GUI on port 8080

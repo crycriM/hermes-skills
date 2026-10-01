@@ -33,8 +33,15 @@ research) and the modeling sections of the `data-science` umbrella.
   from `.env` (submission client). Web3-scoped ops use
   `NUMERAI_STAKE_PUBLIC_ID` / `NUMERAI_STAKE_SECRET_KEY` (also `.env`).
   Plan docs may say `_STAKING_`; the actual var names are `_STAKE_`.
-- Submit cron: `numerai-crypto-submit.sh` (no_agent, 14:30 CEST), watchdog 14:45 —
-  both in `~/.hermes/scripts/`, workdir = project, must absolute-path binaries.
+- Submit cron: `numerai-crypto-submit.sh` (no_agent, cron expr `5 14 * * 2-6` =
+  14:05 local, Tue-Sat), watchdog `45 14 * * 2-6` = 14:45 — both in
+  `~/.hermes/scripts/`, workdir = project; must absolute-path binaries AND harden
+  the env (see "Submit cron failure" below).
+- **Submission window is 14:00-15:00 local (user-authoritative).** A run that
+  finishes after 15:00 misses the round regardless of what the API reports: a
+  round's `closeTime` drifts (seen 13:33 UTC, then 14:51 UTC for the SAME round)
+  while the effective cutoff stays 15:00 local. A still-"Open" `closeTime` is NOT
+  permission to submit late.
 
 ## numerapi 2.23.2 pitfalls (verified)
 
@@ -53,8 +60,8 @@ research) and the modeling sections of the `data-science` umbrella.
   are fine without it. Round timestamps come back as ISO strings
   (`2026-08-25T12:00:00Z`), not unix — parse with `datetime.fromisoformat`.
 - Round windows are IRREGULAR (24h–72h, opening daily at 14:00 CEST). The
-  submit cron fires at 14:30 CEST, right after a 14:00 open — so most open
-  rounds ALREADY have a selected submission from that day's 14:30 run.
+  submit cron fires at 14:05 local, right after a 14:00 open — so most open
+  rounds ALREADY have a selected submission from that day's 14:05 run.
   Before a MANUAL submission: (1) verify the window is open via
   `rounds(tournament: 12, number: N) { openTime closeTime }` (ISO strings,
   parse with fromisoformat), and (2) list existing submissions with
@@ -125,6 +132,23 @@ only TIGHTEN it, never raise it).
   completes in seconds but cron dies with no output file, suspect cgroup
   OOM — check `journalctl --since ... | grep -E 'oom-kill|Memory cgroup'`
   and the scope's `Consumed ... memory peak` line.
+
+### Submit cron failure: PYTHONPATH leak breaks `import lightgbm`
+
+The Hermes worker that runs no_agent jobs inherits a `PYTHONPATH` pointing at
+Hermes's OWN interpreter site-packages
+(`~/.hermes/installs/*/environments/*/venv/lib/python<X.Y>/site-packages`). The
+submit script's `uv run python3` passes that through, so the project's python3.12
+venv imports the worker's py3.14 `cffi` against its own `_cffi_backend` → every
+model dies at `import lightgbm` with `Version mismatch: this is the 'cffi'
+package version ...`, `exit=1`, no training, no upload. Same all-5-fail-at-once
+signature as the OOM case, but the per-model logs carry a traceback instead of
+going silent.
+
+FIX: `unset PYTHONPATH` near the top of `numerai-crypto-submit.sh` — the project
+needs no PYTHONPATH (uv resolves `src` from pyproject.toml). Verify by running
+`uv run python3 -c "import lightgbm"` under the leaked env: it must pass. General
+rule + the PATH twin live in the `hermes-cron-operations` skill.
 
 ## Support files
 

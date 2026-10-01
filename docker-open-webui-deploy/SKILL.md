@@ -154,6 +154,37 @@ Useful when Docker is overkill or unavailable.
    open-webui serve --port 8088
    ```
 
+## Upgrading an existing venv Install
+
+The service runs `~/start-open-webui.sh` → `~/open-webui-venv/bin/open-webui serve --port 8088`, with `DATA_DIR=/home/cricri/openwebui_data` (SQLite `webui.db` is in WAL mode).
+
+1. **Back it up first** — never copy a live WAL database with `cp`; take a consistent snapshot via SQLite's own API:
+   ```bash
+   python3 - <<'EOF'
+   import sqlite3, datetime
+   src='/home/cricri/openwebui_data/webui.db'
+   dst=f"/home/cricri/backups/openwebui/webui-{datetime.datetime.now():%Y%m%d-%H%M%S}.db"
+   c=sqlite3.connect(src); c.execute("VACUUM INTO ?", (dst,)); c.close()
+   print(dst)
+   EOF
+   ```
+2. **Stop, upgrade, start** (upgrading while the service holds the venv open leaves a half-swapped env):
+   ```bash
+   systemctl --user stop open-webui
+   ~/open-webui-venv/bin/pip install --upgrade open-webui
+   systemctl --user start open-webui
+   ```
+3. **Wait for readiness, then verify** — `/health` returns 200 within seconds once migrations finish:
+   ```bash
+   curl -s http://localhost:8088/api/config   # {"status":true,...,"version":"x.y.z"}
+   journalctl --user -u open-webui --since "3 min ago" | grep -iE 'error|migration'
+   ```
+
+### Upgrade pitfalls
+- Alembic migrations run automatically on first start; each upgrade logs `Running upgrade <rev> -> <rev>` lines. A crash-loop after upgrade usually means a migration failed — restore the backup `webui.db` with the service stopped.
+- `pip install --upgrade` also bumps transitive deps (langchain-core, aiodns, pycares…); read the tail of pip output for downgrades, they can break custom functions/pipelines.
+- `requires_python` is `>=3.11,<3.13`; the venv's 3.11 is fine, never upgrade Python to 3.13+ for this app.
+
 ## API-Based Configuration (No Browser Needed)
 
 When Playwright cannot install (e.g. Ubuntu 26), configure via curl:

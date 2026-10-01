@@ -61,7 +61,7 @@ This is distinct from a simple OOM where just one process dies cleanly. Full-sys
 
 - **vm.overcommit_memory:** Default `0` (heuristic) is fine. Do not set to `2` (strict) — it will kill processes on allocation rather than on memory pressure.
 
-- **Model load limits:** The router's `--models-max 4` cap prevents loading too many models simultaneously. The loaded models consume ~15GB (qwen36-35b) + ~0.4GB (qwen35-9b). Loading deepseek-v4-flash (84GB) on top of those is what tips over the edge.
+- **Model load limits:** The router's `--models-max 4` cap prevents loading too many models simultaneously. The preloaded lanes alone are tens of GB (qwen38-27b 20.9 GB + qwen36-35b 29.2 GB ≈ 50 GB). Loading deepseek-v4-flash (84-97 GB) on top of those is what tips over the edge.
 
 - **Check before loading a large model:** Verify free RAM is sufficient:
   ```bash

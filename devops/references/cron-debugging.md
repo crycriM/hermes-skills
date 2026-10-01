@@ -71,6 +71,34 @@ systemctl --user kill --signal=SIGKILL hermes-gateway.service
 - Delivery errors and execution errors are separate failure modes — check `last_status` vs `last_delivery_error` in the cron job list.
 - Cron jobs never share the `deliver` route with an active gateway session (they use `standalone_sender_fn`, not the adapter's live connection).
 
+---
+
+## Routing a Cron Job's Delivery to a Specific Telegram Forum Topic
+
+A Telegram group with topics enabled is a *forum*: messages in a topic carry a `thread_id`, and a cron job only lands in a topic when its `origin` carries that `thread_id`. A job with `origin: null` delivers to the platform home / the whole group instead.
+
+### Procedure
+
+1. **Set `origin` on the job.** The gateway reads `cron/jobs.json` fresh on every delivery, so an edit takes effect on the next run — no gateway restart required (unlike plugin/config changes). Edit the file directly; it is not under the `config.yaml` security gate, so `patch` or `python3` both work.
+
+   ```json
+   "deliver": "origin",
+   "origin": {"platform": "telegram", "chat_id": "-1003835592883",
+              "chat_name": "PinceMi et PinceMoi", "thread_id": "960",
+              "user_id": "1867239837"}
+   ```
+
+   `deliver` stays `"origin"`; the concrete target lives in `origin`. Copy the exact shape from a sibling job that already delivers to the right place — the watchdog cron in this deployment already has a populated `origin` for the Numerai topic, so the submit cron's `origin` was just switched from `null` to the same object.
+
+2. **Confirm the `thread_id` is real before relying on it.** The bot may be a *member* of the forum without admin rights, which blocks the obvious discovery path.
+
+### Pitfalls
+
+- **A member bot cannot enumerate forum topics via the API.** `getForumTopics` and `getChatHistory` both return `404 Not Found` when the bot lacks admin rights — the API is not telling you the topic doesn't exist, it is telling you you can't see the list. Don't burn calls trying to list topics.
+- **Verify a suspected `thread_id` by sending, not by asking.** Send a probe message to the topic with `sendMessage` + `message_thread_id=<id>`; a 200 with the topic echoed back confirms it. A topic that silently accepts a send is the one to route to.
+- **Prefer copying a working sibling's `origin` over discovering from scratch.** If another cron job already delivers to the target topic, reuse its `thread_id` verbatim rather than reverse-engineering it.
+- **The `thread_id` is a message-ID-sized integer, not the topic's internal number.** Use the value that appears in the `origin` of a message already inside the topic.
+
 ### See Also
 - `hermes-agent` bundled skill (protected): docs on plugin management
 - The plugin's `register()` function in `plugins/platforms/discord/adapter.py` defines the `standalone_sender_fn` hook

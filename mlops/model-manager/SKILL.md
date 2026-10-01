@@ -96,6 +96,14 @@ Client → proxy :8079 → router :8080
 
 ## Design constraints
 
+### There is no per-profile model allowlist — "allow model X in profile Y" is just two restarts
+
+Verified 2026-09-27 by grep across `hermes_cli/`, `gateway/`, `config_defaults.py`, `router-preset.ini` and `model_manager.py`: nothing in the stack gates a model by Hermes profile. A profile reaches any model the proxy serves — `providers.<p>.local` carries only `base_url` + `default_model` (no `models:` allowlist in either the default or any named profile), `hermes model` has no list/allow subcommand, and the proxy itself has no profile concept at all (its request log keys on `User-Agent` only).
+
+So a new preset section becomes usable everywhere at once, and the only two steps are:
+1. `systemctl --user restart m5-router` — llama.cpp caches the INI at startup; a section added after boot is invisible (and the model path/size are read at boot).
+2. `systemctl --user restart model-manager` — new `[section]` names are not discovered at runtime (see above). Each restart reloads every `load-on-startup = 1` model, so ask before doing it.
+
 ### `model-manager-config.yaml` is NOT a load list
 
 This config file contains only per-model **reasoning tuning parameters** (`max_reasoning_tokens`, `logit_bias_strength`, `target_thinking_tokens`). It is NOT:
@@ -262,6 +270,103 @@ systemctl --user restart model-manager          # restarts model_manager.py on 8
 
 Restart model-manager (not model-manager-gui) when changing `model_manager.py`. Only model-manager-gui needs restart when editing files in `gui/`.
 
+## Side-lane buttons: qwen3.8-flash + ComfyUI (2026-09-28)
+
+Two controls in the GUI header (`gui/index.html`) beside the routing kill-switch,
+backed by model_manager.py. Both are control endpoints, so they stay live while
+routing is OFF (`_is_model_serving_path()` does not list them).
+
+| endpoint | what it does |
+|---|---|
+| `GET /api/lanes` | `{flash: {...}, comfyui: {...}, routing_enabled: bool}` — polled with the rest of the GUI refresh |
+| `POST /api/lane/flash` | `{"action":"start"\|"stop"}` — the halogen lane (container `halogen-flash`, :8741) |
+| `POST /api/comfyui` | `{"action":"start"\|"stop"}` — `systemctl --user start/stop comfyui` |
+
+**The flash START is gated, in the UI and again server-side** (a 409 naming every
+blocker, never a silent side effect on someone else's service):
+
+1. routing must be OFF — the kill-switch is what frees the ~93 GiB the lane needs;
+2. ComfyUI must be stopped — this box does not run a render beside the lane.
+
+STOP is never gated (you must always be able to give the memory back), and
+ComfyUI is startable in either routing state on purpose: the PE lanes run beside
+the router.
+
+### The flash lane has TWO modes, one container (2026-09-29)
+
+`POST /api/lane/flash` takes `{"action": "start"|"stop", "variant": "text"|"vision"}`;
+`GET /api/lanes` reports `variant`, `vision`, `variants`, `in_flight`, `busy_for_s`.
+The GUI header has one Load button per mode (text / +Vision): the button of the
+mode that is resident stops the lane, the other one switches it (with a confirm).
+An omitted `variant` keeps whatever mode is resident, so a plain start can never
+silently change a running lane's mode.
+
+- `variant=vision` only adds `-e HALOGEN_VISION_TOWER=1`; the launcher takes it
+  as `VISION=1` and `DRY_RUN=1` prints the argv without starting anything.
+- **Refuse the switch while the engine is serving**: a switch replaces the
+  container, which cuts off the request in flight. Measured 2026-09-29 — the
+  lane had `in_flight=1` from a live client and both the proxy and the GUI now
+  answer 409 / disable the button until it is idle.
+- A start when the lane already runs in the requested mode is a 200 no-op
+  (`already running in <mode> mode`) — no pointless 90 s reload.
+
+### Pitfall: the transient scope's name is single-use
+
+`_start_flash_detached()` launches the lane with `systemd-run --scope --unit
+halogen-flash-lane`. While the container lives, its processes keep that scope
+**ACTIVE**, so the name is taken: a second `systemd-run` with the same unit
+fails with
+
+```
+Failed to start transient scope unit: Unit halogen-flash-lane.scope was already loaded or has a fragment file.
+```
+
+The old code matched the substring `already exists`, which that message does NOT
+contain — so every second start of the lane answered **HTTP 500** instead of
+restarting it (hit 2026-09-29, harmlessly: nothing was stopped). The robust
+order is now: stop the container cleanly (`podman stop -t 60`) → poll
+`podman container inspect` until it is gone → poll `systemctl --user is-active
+<scope>.scope` until it is inactive (systemd collects it, `--collect`) → *then*
+`systemd-run`. Never free the name by stopping the scope: a cgroup SIGKILL is
+what leaks the halogen engine's GTT allocation.
+
+### Pitfall: a container started by a service dies with that service
+
+podman here uses the **cgroupfs** cgroup manager, so a container's cgroup is
+nested under whatever cgroup the calling podman process is in. Launching the
+lane straight from `model-manager.service` put it under
+`app.slice/model-manager.service` and `systemctl --user restart model-manager`
+killed it (measured: `container=exited` seconds after the restart).
+
+Fix: launch it in a transient scope, which gives the container a cgroup of its
+own, a sibling of the service:
+
+```
+systemd-run --user --collect --scope --unit=halogen-flash-lane \
+    /bin/bash ~/llm-server/start-halogen-flash.sh
+```
+
+The scope stays active while the container runs (`--collect` GCs it when empty),
+and `systemctl --user list-units | grep halogen-flash-lane` shows it. Retry once
+via `systemctl --user stop halogen-flash-lane.scope` if systemd-run reports the
+unit already exists. **Generalise this:** any user service that launches podman
+containers must use `systemd-run --scope`, or a restart of that service takes
+the containers down with it. Stop such a container with `podman stop -t 60`, not
+by stopping the scope — a cgroup SIGKILL is what leaves the halogen engine's
+GTT allocated (see the `halogen-flash-lane` skill).
+
+### The routing kill-switch is now persisted
+
+`ROUTING_ENABLED` was module-level only, so **every restart silently turned
+serving back ON**, `Restart=on-failure` bounces included. With the flash lane
+holding ~93 GiB that is a live hazard on this box: a client request would be
+free to load a model with no room for one. It now reads and writes
+`~/.llm-server/.routing_state.json` (`_load_routing_state` at import,
+`_save_routing_state` on every toggle; override the path with
+`ROUTING_STATE_FILE`). Check the live value with `GET /api/routing`, and note
+that a state you set in the GUI now survives `systemctl --user restart
+model-manager`.
+
 ## Router API endpoints (passthrough)
 
 - `GET /v1/models` — list models with status (`loaded`/`unloaded`/`loading`/`error`), preset args, architecture
@@ -371,10 +476,10 @@ The startup script validates the preset INI against known llama.cpp options befo
     **Fix:** Add the model to `~/llm-server/model-manager-config.yaml` so the proxy injects `reasoning_budget` + logit bias:
     ```yaml
     models:
-      qwen35-9b:
-        max_reasoning_tokens: 512
-        logit_bias_strength: 10.0
-        target_thinking_tokens: 200
+      qwen36-35b:
+        max_reasoning_tokens: 4096
+        logit_bias_strength: 11.8
+        target_thinking_tokens: 800
     ```
     Then `systemctl --user restart model-manager`.
 
@@ -757,8 +862,29 @@ The `/api/models` and `/api/available` endpoints now include an `enable_thinking
 
 ## Debugging Reasoning Infinite Loops
 
-Three separate mechanisms control reasoning output (two active, one disabled):
+### DRY (sequence-aware repetition penalty) — present but DISABLED (2026-09-25)
 
+The running build's default sampler chain is `penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature` — DRY is in the chain but inert: `dry_multiplier = 0.0` (the on/off switch), `dry_base = 1.75`, `dry_allowed_length = 2`, `dry_penalty_last_n = 64` in the live server defaults (source says default -1 → mapped to slot ctx; the build diverges, so set it explicitly). `[qwen36-35b]` also runs `repeat-penalty = 1.0`, i.e. no classic repetition penalty either. Net: repetition control is off, and the reasoning budget/logit bias is the only loop control that exists.
+
+Implementation (source-verified): `penalty = dry_multiplier * dry_base^(repeat_len - dry_allowed_length)`, subtracted from the logit, applied only to tokens that would EXTEND an existing repeat, skipped for single-token sequence breakers (defaults `\n`, `:`, `"`, `*`).
+
+Measured on qwen36-35b (verbatim-degenerate prompt, 300 tokens): `dry_multiplier` 0.0 → max repeated 5-gram 4, dup_ratio 0.156; 0.8 → 3 / 0.038; 1.5 → 3 / 0.010. So DRY is functional and its keys work over HTTP.
+
+**Two distinct loop classes — do not conflate them.**
+
+*Class 1 — non-converging thinking (DRY irrelevant).* Reproduced 5/5 on `Rephrase this more clearly: "..."` at 600-token caps: the model spends the entire budget in reasoning, emits zero content, and carries essentially no verbatim repetition (dup_ratio 0.000). `dry_multiplier` 0.0/0.5/0.8, breakers disabled, and `repeat_penalty` 1.1 all produced identical shape — DRY has no repeated n-grams to penalise. This is the reasoning budget + close-token bias domain. Confirmed: the same prompt with `reasoning_budget_tokens: 512` produced a 393-char answer where every control produced none.
+
+*Class 2 — verbatim block/line repetition (DRY territory).* Seen in real transcripts (long drafting monologues that end in the same 3-line block repeated 13+ times, separated by "I will output these."). This IS what DRY targets, and DRY demonstrably bites on such text in this build (dup_ratio 0.156 → 0.038 at 0.8 → 0.010 at 1.5 on a deliberately degenerate prompt). It could NOT be reproduced on demand in 8 attempts across 4 prompts (including 2000-token runs, which finished naturally) — the loop is situational, so capture temperature, max_tokens, system prompt and thinking state when it recurs.
+
+**Breaker mechanics matter for block loops (source-verified).** Detection is bounded by restart sequences: `rep_limit` = number of tokens since the most recent breaker token, and if that is `< dry_allowed_length` the sampler returns immediately without penalising. Default breakers are newline, colon, double-quote and asterisk, so a repeated block whose lines are newline-separated cannot be seen as one long repeat — the match length is clamped per line. A repeated *line* is still ~10+ tokens against an allowed length of 2, i.e. penalty ≈ `0.8 * 1.75^(11-2)` ≈ 77 nats (exponent clamped at ~158 for base 1.75), so line-level loops should still be suppressed hard. Add language-specific breakers (e.g. `;`, `{`, `}` for code) only if a loop is specifically crossing them.
+
+**Gotchas if you do enable it:**
+- The HTTP API **rejects `dry_penalty_last_n: -1`** (`Value must be between 0 <= value <= 2147483647`) even though the CLI accepts -1 and maps it to the slot ctx. Third-party docs that give `"dry_penalty_last_n": -1` in a body example will 400 on this build. Use a positive window (1024 tested fine).
+- Preset INI route needs `KNOWN_KEYS` in `start-native-router.sh` extended: it contains no `dry-*` keys and no `samplers`, so adding `dry-multiplier` there makes the launcher refuse to start. The per-request body keys (`dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers`) avoid this and need no restart.
+- Sampler reordering (DRY after temperature, as recommended for QwQ-32B) cannot be expressed through the preset today — it needs the `samplers` flag plus a `KNOWN_KEYS` extension. Treat that reorder as a per-model hypothesis to test, not a rule.
+
+
+Three separate mechanisms control reasoning output (two active, one disabled):
 1. **llama-server native `reasoning_budget`** (per-request API parameter, injected by model_manager — active). Progressive sampler that increasingly forces the `</think>` end sequence as the budget approaches. Configured by `max_reasoning_tokens` in `model-manager-config.yaml`. Logs: `reasoning-budget: activated, budget=N tokens`, `reasoning-budget: deactivated (natural end)`, `reasoning-budget: budget exhausted, forcing end sequence`.
 
 2. **model_manager `logit_bias`** (per-request, active). Constant additive bias on `</think>` token as a gentle early nudge. Configured in `~/llm-server/model-manager-config.yaml`. Only visible at DEBUG level (`--verbose` flag).
@@ -815,7 +941,7 @@ When a model generates 4000+ thinking tokens at ~22 t/s, it takes **186+ seconds
 - model_manager enforces `max_tokens = max_reasoning_tokens + 512` (4096 + 512 = 4608 total) when caller omits it
 - When caller sets `max_tokens > budget`, bias = `max(11.8 * 0.15, 11.8 * 800 / max_tokens)` — always nudges, never zero
 - `model_manager.py` runs with `--verbose` (debug-level bias and injection logs visible)
-- Logit bias targets the LAST token of `</think_>` sequence (token 94979 = `_>` for Qwen models), NOT the first (510 = `</` which is too generic)
+- Logit bias targets the model's real close token, resolved by `resolve_thinking_close_token()`: it tokenizes the candidates in `THINKING_CLOSE_TAGS` and prefers the first that yields exactly ONE token (a genuine control token in the vocab). For qwen36-35b that is the plain no-underscore close tag = token **248069**; the previously hardcoded `</think_>` last fragment 94979 has no measurable effect on sampling (see the 2026-09-25 notes below)
 - `logit_bias` uses **positive** values to PROMOTE the close tag (make it more likely). Negative would suppress it, causing longer thinking.
 - systemd unit has `After=m5-router.service` to avoid startup race where `/tokenize` fails with Connection refused
 - Lazy-load fallback in bias injection handles cases where startup preload still fails
@@ -864,11 +990,11 @@ Since 2026-05-23, model_manager injects TWO controls per request for thinking mo
 
 **How they work together:**
 
-The proxy injects `reasoning_budget = max_reasoning_tokens` then applies the logit_bias on top:
+The proxy injects `reasoning_budget_tokens = max_reasoning_tokens` then applies the logit_bias on top:
 
 ```python
-req["reasoning_budget"] = budget  # native progressive sampler
-logging.debug(f"Injected reasoning_budget={budget} for {model}")
+req["reasoning_budget_tokens"] = budget  # native progressive sampler (llama.cpp body key)
+logging.debug(f"Injected reasoning_budget_tokens={budget} for {model}")
 # ... then existing logit bias logic applies
 ```
 
@@ -912,6 +1038,27 @@ Example with strength=11.8, target=800, budget=4096:
 
 For models that tend to loop, increase `bias_strength` (13-15) or lower `target_thinking_tokens`. For models that cut thinking too short, decrease strength to 5-8 or raise the budget.
 
+### Corrected 2026-09-25: body key name AND close-token id were both no-ops
+
+Two independent defects made the qwen36-35b reasoning guard ineffective. Both were proven with live probes against the router, not inferred from config.
+
+**1. Wrong request body key.** llama.cpp reads `reasoning_budget_tokens` (alias `thinking_budget_tokens`) from the body and otherwise falls back to the CLI `--reasoning-budget`; a plain `reasoning_budget` key is **silently ignored** — unknown body fields raise no error. model_manager injected `reasoning_budget`, so the "native progressive budget" documented above never reached the sampler. Proof, same prompt three ways: no budget → `finish=length`, 400 tokens of thinking, zero answer; `reasoning_budget_tokens=64` → `finish=stop` with the correct answer; `reasoning_budget=64` → byte-identical to no budget. Fixed in `model_manager.py` (`_handle_completion`).
+
+**2. Wrong close token.** `preload_thinking_tokens()` hardcoded the last fragment of the underscore tag. Probing the qwen36-35b vocab shows why that is useless as a bias target:
+
+```python
+"<" + "/think" + ">"        # -> [248069]              single token = the REAL close control token
+"<" + "think" + ">"         # -> [248068]              single token = the open control token
+"<" + "/think" + "_" + ">"  # -> [510, 26003, 94979]   multi-token; 94979 is only the '_>' fragment
+"<" + "/thinking" + ">"     # -> [510, 79420, 29]      multi-token
+```
+
+Bias on 94979 (+10.65 and +30) never closed thinking; bias on 248069 (+10.65) closed it in ~30 chars. Fixed by `resolve_thinking_close_token()`: tokenize `THINKING_CLOSE_TAGS`, prefer the first candidate that yields exactly ONE token (that only happens for a genuine control token), fall back to the old last-fragment behaviour.
+
+**Rule:** before blaming the model, verify the body key AND the close-token id. Also remember a budget only bites as generation approaches it — `max_reasoning_tokens: 4096` does nothing about a model burning a 600-token `max_tokens` on thinking; scale the budget to the horizon you actually care about.
+
+**Editing pitfall:** literal think-tag sequences can be stripped out of agent message text in transit, silently leaving `r""` (empty string) in the source — which makes the resolver return `None` and skips the whole bias/budget block. Build such literals by concatenation (`"<" + "think" + ">"`) and verify char codes/`len()` before trusting the edit.
+
 ### Fixed: bias now fires for all thinking-model requests (2026-05-06)
 
 Previously, callers that set `max_tokens >= max_reasoning_tokens` (e.g. KiloCode sending `max_tokens=4096` against a budget of 1024) got **zero bias**. The model would think unchecked for 100+ seconds (2839 tokens observed in one case). The fix adds Path C to the bias formula: when `max_tokens > budget`, bias = `max(strength * floor%, strength * target / max_tokens)`. The `target_thinking_tokens` parameter (default 800, ~40s at 20 tok/s) controls when the nudge kicks in; the floor (now 15%) prevents it from vanishing on huge hardcaps.
@@ -929,9 +1076,11 @@ With `reasoning-budget = 1024`, this fires immediately on any conversation with 
 
 **Solution for long multi-turn chats:** Disable `reasoning-budget` in the preset entirely. The per-request `reasoning_budget` API parameter uses the same sampler code so the prefill bug still applies on long conversations. For short/fresh chats it works perfectly. For long chains, model_manager's `max_tokens` (output-only) + `logit_bias` (output-only) remain the bug-free fallback since they only constrain generation tokens, never prefill. The per-request reasoning_budget is the default active mechanism; drop back to bias-only when you see prefill exhaustion on a multi-turn conversation.
 
+**Documented exception (2026-09-25):** `[qwen36-35b]` in `router-preset.ini` now carries `reasoning-budget = 4096` plus `reasoning-budget-message = ...stop thinking and give the final answer.` so direct :8080 calls (benchmarks, standalone clients) are capped too. 4096 gives far more headroom than the 1024 seen to explode on prefill, but watch for the exhaustion signature (`reasoning-budget: activated` immediately followed by `budget exhausted, forcing end sequence`) on long multi-turn chats that preserve thinking, and remove the preset key if it appears.
+
 ## Model Selection for Cron/Automated Jobs
 
-**qwen35-9b is the go-to model for all automated cron jobs.** Use it for any recurring task that involves web scraping, research, summarization, or report generation. It delivers 2-7s API call latency with 95-100% cache hits, handles up to 65k context without compression, and never triggers proxy timeouts.
+**`qwen36-35b` (the local lane on :8079) is what automated jobs run on.** Keep the thinking cap in place for it — the model-manager proxy injects `reasoning_budget_tokens` + logit bias for it per `model-manager-config.yaml`, and that is what keeps auxiliary calls (context compression, titles, triage) from hanging. The retired `qwen35-9b` lane was the cheap-and-fast option here (2-7 s per call, 95-100% cache, 65k ctx, proxy timeouts never reached); it was removed from the preset on 2026-09-28, so its numbers are history, not a current option.
 
 **Thinking-mode models (qwen36-35b with `enable_thinking:true`) will hang cron jobs.** Context compression and other auxiliary calls generate reasoning tokens before output, causing indefinite hangs. **qwen36-27b** (thinking off) works for low-context tasks but hits proxy 502 timeouts above ~60k tokens.
 

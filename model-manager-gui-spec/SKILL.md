@@ -63,6 +63,21 @@ The models table shows a "Thinking" column derived from the `enable_thinking` fi
 - **N** (muted) — `enable_thinking: false` in preset (thinking explicitly disabled)
 - **—** (gray) — no `chat-template-kwargs` in preset (model default)
 
+## Mobile / small-screen layout
+
+The GUI is used from an Android phone at ~360-412 CSS px. Rules that keep it inside the frame:
+
+- `.header` and `.header-right` must both be `flex-wrap:wrap` — without wrapping the 723px-wide control row forces the whole document wider than the viewport, so the banner looks oversized and the page scrolls sideways.
+- The table lives in `<div class="table-wrap">` (`overflow-x:auto`), so a wide table scrolls inside the card instead of pushing the page wide.
+- `@media(max-width:768px)` turns the models table into one stacked card per model: `thead` hidden, `tr/td` set to `display:block/flex`, and every `<td>` carries `data-label` so `td::before{content:attr(data-label)}` supplies the column name. Adding a column means adding its `data-label` in the row template in `index.html` (render loop, `m-actions`/`m-name` classes mark the special cells).
+- Verify with playwright at 360/412: assert `documentElement.scrollWidth === clientWidth` and that no `tbody td` right edge exceeds the models `.card` right edge.
+
+## Services
+
+`model-manager-gui.service` runs `gui_server.py` (:8081) and is independent of `model-manager.service`, which runs `model_manager.py` (:8079). Restart only the GUI unit for dashboard changes — restarting the proxy/router pair activates staged preset config the user may be holding back.
+
+`gui_server.py` `_send_file()` sends `Cache-Control: no-store`, so edits to `gui/` show up on the next reload without cache clearing.
+
 ## Notes
 
 - No authentication layer (LAN-only use)

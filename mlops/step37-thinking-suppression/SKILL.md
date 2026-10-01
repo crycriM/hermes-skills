@@ -139,7 +139,7 @@ Syntax errors eliminated. Remaining failures are logic issues (p08 merge_k, p14 
 ## Refresh After Reboot
 
 1. Verify router + model_manager are up
-2. Wait for auto-load to finish (qwen36-35b, qwen35-9b, qwen36-27b)
+2. Wait for auto-load to finish (qwen38-27b, qwen36-35b)
 3. Unload auto-loaded models: `POST /models/unload` for each
 4. Load step37: `POST /models/load {"model":"step37"}`
 5. Wait for status "loaded" (~85s)

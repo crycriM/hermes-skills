@@ -182,7 +182,15 @@ Map ports to running services and their launch sources. Debug what's listening, 
 
 See: `references/system-service-discovery.md`
 
-## 11. OOM / System Freeze Diagnostics
+## 11. Local File Serving & LAN Web-UI Verification
+
+Publish a folder over HTTP with a stdlib server + systemd user unit, and verify
+local/LAN pages in a browser (`browser_exec` blocks private addresses — use the
+Playwright MCP tools).
+
+See: `references/lan-file-serving.md`
+
+## 12. OOM / System Freeze Diagnostics
 
 When SSH or the whole machine becomes unresponsive, the root cause is often memory overcommit and swap exhaustion — not a service crash. The diagnostic pattern: check system load, swap usage, kernel OOM kills in dmesg, and top memory consumers to trace the chain.
 

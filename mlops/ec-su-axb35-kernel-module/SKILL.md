@@ -111,8 +111,6 @@ sudo update-grub
 
 **May 2025 session:** After kernel 7.0.0-15 update, module was already GRUB-pinned. Verified: `extra/` dir had stale unsigned .ko, `updates/` had correct signed one. Cleaned `extra/`, confirmed `updates/` takes precedence. GRUB pin already active — no action needed beyond confirming.
 
-## Pitfalls
-
 ## Monitoring and automatic mode switching
 
 You can add a lightweight watchdog that checks the APU power mode and temperature every 30 seconds. If the mode stays in `quiet` for longer than 10 minutes **and** the CPU temperature exceeds 65 °C, the watchdog will automatically switch the mode to `balanced` to avoid prolonged throttling.
@@ -154,46 +152,7 @@ systemctl enable --now ec-apu-watchdog.service
 
 This ensures the system automatically falls back to a safer power mode without manual intervention.
 
-## Monitoring and automatic mode switching
-
-You can add a lightweight watchdog that checks the APU power mode and temperature every 30 seconds. If the mode stays in `quiet` for longer than 10 minutes **and** the CPU temperature exceeds 65°C, the watchdog will automatically switch the mode to `normal` to avoid prolonged throttling.
-
-### Example systemd service
-
-Create `/etc/systemd/system/ec-apu-watchdog.service`:
-
-```ini
-[Unit]
-Description=Watchdog for ec_su_axb35 APU power mode
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/ec-apu-watchdog.sh
-```
-
-Create the script `/usr/local/bin/ec-apu-watchdog.sh`:
-
-```bash
-#!/usr/bin/env bash
-MODE=$(cat /sys/class/ec_su_axb35/apu/power_mode)
-TEMP=$(cat /sys/class/thermal/thermal_zone*/temp | head -1)
-# temperature in millidegree Celsius
-if [[ "$MODE" == "quiet" && $TEMP -gt 65000 ]]; then
-    echo "APU quiet mode + high temp, switching to normal"
-    echo normal > /sys/class/ec_su_axb35/apu/power_mode
-fi
-```
-
-Make it executable:
-
-```bash
-chmod +x /usr/local/bin/ec-apu-watchdog.sh
-systemctl daemon-reload
-systemctl enable --now ec-apu-watchdog.service
-```
-
-This ensures the system automatically falls back to a safer power mode without manual intervention.
+## Pitfalls
 
 - **Version mismatch:** Module won't load if vermagic doesn't match running kernel. Always rebuild.
 - **Secure Boot:** Unsigned module will be rejected. Always sign with MOK keys.

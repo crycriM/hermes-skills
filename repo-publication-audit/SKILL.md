@@ -62,8 +62,23 @@ __pycache__/
 
 See: `references/pii-scan-patterns.md` — ready-to-use grep patterns for PII and secret scanning.
 
+## 7. Purging a file from an already-published history
+
+The scan above is not only for pre-publication. When something sensitive turns out to be already in a public repo, removing it from the tip is not enough: `git rm --cached` stops future commits only — every old commit keeps the blob, and the remote keeps serving it. Do the full purge, in this order.
+
+1. **Snapshot the repo and any live file first.** `tar czf repo-pre-purge-$(date +%F-%H%M).tar.gz -C <parent> <repo>` (keep `.git/` — it is the only copy of the history you are about to rewrite). This matters because `git filter-repo --force` resets the working tree to the rewritten HEAD: any *uncommitted* modification to a tracked file is silently replaced by the old committed version, and a rewrite that drops a path can take the working copy with it. Back up untracked-but-important files too.
+2. **Untrack + gitignore, commit, then rewrite** — `git rm --cached <paths>` (files stay on disk), add the paths to `.gitignore`, commit, then `git filter-repo --path <p1> --path <p2> --invert-paths --force`. Bundle every sensitive path into ONE rewrite: each rewrite invalidates every clone, so a second pass is a second forced push for no gain.
+3. **Re-add the remote and force-push** — filter-repo deliberately deletes `origin`. `git remote add origin <url> && git push --force origin main && git branch --set-upstream-to=origin/main main`.
+4. **Verify from a fresh mirror clone of the remote**, never from the local repo: `git clone --mirror <url> /tmp/mirror` then `git log --all --oneline -- <paths>` (expect empty) and `git rev-list --objects --all | grep -E '<paths>'` (expect nothing).
+5. **State the residual honestly.** GitHub keeps unreachable objects and still answers `git fetch origin <old-sha>` and `git cat-file -p <blob-sha>` for them, so the file can remain retrievable by anyone holding a SHA. Only deleting and recreating the repository — or a GitHub Support GC request — guarantees removal; switching the repo to private cuts public access immediately. Say which one you did and which is still outstanding.
+6. **Bound the real exposure window** instead of assuming "public since forever": `GET /repos/<owner>/<repo>/events` shows the PushEvents (first real push date) and the repo object shows `forks_count` / `watchers_count`.
+
+See: `references/history-purge.md` — command sequence, verification, and the residual-exposure decision table.
+
 ## Pitfalls
 
+- **`git rm --cached` is not a purge, and a delete commit is not a trace removal.** Removing a file from a public repo requires the filter-repo rewrite plus a force push; the delete commit alone leaves every earlier commit intact, which the post-cleanup verification above will expose.
+- **Scan `git ls-files`, not the working tree.** The tree holds untracked files that are not published; the tracked list is what is exposed. It is how a TLS `key.pem` sitting in `reverse-proxy/certs/` gets found — a private key warrants regeneration, not just removal from history, because it was readable for however long the repo was public.
 - **Stale email domains** — Draft content versions often reference old/wrong email addresses (e.g., `@example.com` vs `@example.net`). Check every content version file.
 - **JSON-LD structured data** — `sameAs` arrays in schema.org JSON-LD often contain personal social profiles. This is in the HTML `<head>` and easy to miss.
 - **Hardcoded profile URLs in multiple locations** — A personal LinkedIn URL typically appears in: JSON-LD `sameAs`, About section links, and Footer. All three must be replaced.
